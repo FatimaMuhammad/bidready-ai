@@ -116,7 +116,7 @@ st.markdown(
 </style>
 """,
 unsafe_allow_html=True,
-```
+
 
 )
 
@@ -142,10 +142,10 @@ DEFAULT_STATE = {
 
 for key, value in DEFAULT_STATE.items():
 
-```
+
 if key not in st.session_state:
     st.session_state[key] = value
-```
+
 
 # ============================================================
 
@@ -160,7 +160,7 @@ def load_embedding_model():
 return SentenceTransformer(
     EMBEDDING_MODEL
 )
-```
+
 
 # ============================================================
 
@@ -194,7 +194,7 @@ if not api_key:
 return Groq(
     api_key=api_key
 )
-```
+
 
 # ============================================================
 
@@ -207,7 +207,7 @@ uploaded_file,
 document_type: str,
 ) -> List[Dict]:
 
-```
+
 pdf_bytes = uploaded_file.getvalue()
 
 if not pdf_bytes:
@@ -360,7 +360,7 @@ def create_chunks(
 pages: List[Dict],
 ) -> List[Dict]:
 
-```
+
 chunks = []
 
 for page in pages:
@@ -370,7 +370,7 @@ for page in pages:
     )
 
 return chunks
-```
+]
 
 # ============================================================
 
@@ -383,7 +383,7 @@ chunks: List[Dict],
 embedding_model,
 ):
 
-```
+
 if not chunks:
 
     raise ValueError(
@@ -418,7 +418,7 @@ index.add(
 )
 
 return index
-```
+
 
 # ============================================================
 
@@ -434,7 +434,7 @@ embedding_model,
 top_k: int,
 ) -> List[Dict]:
 
-```
+
 if (
     index is None
     or not chunks
@@ -492,7 +492,7 @@ for score, index_number in zip(
     )
 
 return results
-```
+
 
 # ============================================================
 
@@ -505,7 +505,7 @@ tender_results: List[Dict],
 company_results: List[Dict],
 ) -> str:
 
-```
+
 sections = []
 
 if tender_results:
@@ -521,7 +521,7 @@ if tender_results:
 
         sections.append(
             f"""
-```
+
 
 [TENDER EVIDENCE {number}]
 Document: {result["document"]}
@@ -533,7 +533,7 @@ Content:
 """
 )
 
-```
+
 if company_results:
 
     sections.append(
@@ -547,7 +547,7 @@ if company_results:
 
         sections.append(
             f"""
-```
+
 
 [COMPANY EVIDENCE {number}]
 Document: {result["document"]}
@@ -559,7 +559,7 @@ Content:
 """
 )
 
-```
+
 if not sections:
 
     return (
@@ -570,7 +570,7 @@ if not sections:
 return "\n".join(
     sections
 )
-```
+
 
 # ============================================================
 
@@ -584,7 +584,7 @@ tender_results: List[Dict],
 company_results: List[Dict],
 ) -> str:
 
-```
+
 client = get_groq_client()
 
 context = format_context(
@@ -593,7 +593,7 @@ context = format_context(
 )
 
 system_prompt = """
-```
+
 
 You are BidReady AI, an evidence-grounded tender
 readiness assistant.
@@ -633,9 +633,8 @@ is more important than a large number of minor matches.
 Do not provide legal or official procurement advice.
 """
 
-```
 user_prompt = f"""
-```
+
 
 # USER QUESTION
 
@@ -701,7 +700,7 @@ If the evidence is insufficient, do not guess.
 Use NEEDS REVIEW.
 """
 
-```
+
 response = client.chat.completions.create(
     model=GROQ_MODEL,
     messages=[
@@ -731,7 +730,7 @@ if not answer:
     )
 
 return answer
-```
+
 
 # ============================================================
 
@@ -744,7 +743,7 @@ tender_file,
 company_file,
 ):
 
-```
+
 tender_pages = extract_pdf_pages(
     tender_file,
     "Tender",
@@ -798,7 +797,7 @@ return (
     company_index,
     embedding_model,
 )
-```
+
 
 # ============================================================
 
@@ -811,7 +810,7 @@ title: str,
 results: List[Dict],
 ):
 
-```
+
 with st.expander(
     f"{title} ({len(results)} chunks)"
 ):
@@ -888,7 +887,7 @@ st.write(
 
 with st.sidebar:
 
-```
+
 st.header("⚙️ System")
 
 st.markdown(
@@ -955,7 +954,7 @@ else:
     st.warning(
         "Upload both PDFs and build the knowledge base."
     )
-```
+
 
 # ============================================================
 
@@ -971,18 +970,17 @@ col1, col2 = st.columns(2)
 
 with col1:
 
-```
+
 tender_file = st.file_uploader(
     "Tender / RFP PDF",
     type=["pdf"],
     key="tender_pdf",
     help="Upload the tender you want to evaluate.",
 )
-```
+
 
 with col2:
 
-```
 company_file = st.file_uploader(
     "Company Profile PDF",
     type=["pdf"],
@@ -993,7 +991,7 @@ company_file = st.file_uploader(
         "financial information, etc."
     ),
 )
-```
+
 
 # ============================================================
 
@@ -1003,7 +1001,7 @@ company_file = st.file_uploader(
 
 if tender_file and company_file:
 
-```
+
 st.divider()
 
 if st.button(
@@ -1091,7 +1089,7 @@ if st.button(
 
 if st.session_state.documents_ready:
 
-```
+
 st.header(
     "📚 Knowledge Base"
 )
@@ -1150,7 +1148,7 @@ with st.expander(
         use_container_width=True,
         hide_index=True,
     )
-```
+
 
 # ============================================================
 
@@ -1160,7 +1158,7 @@ with st.expander(
 
 if st.session_state.documents_ready:
 
-```
+
 st.divider()
 
 st.header(
@@ -1269,16 +1267,16 @@ if question:
             st.error(
                 f"Analysis failed: {exc}"
             )
-```
+
 
 else:
 
-```
+
 st.info(
     "👆 Upload both a tender PDF and a company profile PDF, "
     "then build the knowledge base."
 )
-```
+
 
 # ============================================================
 
