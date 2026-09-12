@@ -1,28 +1,36 @@
+```python
 import os
-import json
 import re
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import List, Dict, Tuple
 
-import fitz  # PyMuPDF
+import faiss
+import numpy as np
 import streamlit as st
-from dotenv import load_dotenv
-from google import genai
+import fitz  # PyMuPDF
+
+from sentence_transformers import SentenceTransformer
+from groq import Groq
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-load_dotenv()
-
 APP_NAME = "BidReady AI"
 
-PROMPT_FILE = Path(__file__).parent / "requirements_prompt.txt"
+GROQ_MODEL = "openai/gpt-oss-20b"
+
+# Lightweight and strong general-purpose embedding model.
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+TOP_K = 6
+
+CHUNK_SIZE = 900
+CHUNK_OVERLAP = 150
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -34,81 +42,56 @@ st.set_page_config(
 
 
 # ============================================================
-# CUSTOM STYLING
+# CUSTOM CSS
 # ============================================================
 
 st.markdown(
     """
     <style>
-        .main-title {
-            font-size: 3rem;
-            font-weight: 800;
-            color: #0F172A;
-            margin-bottom: 0;
-        }
 
-        .subtitle {
-            font-size: 1.2rem;
-            color: #64748B;
-            margin-bottom: 2rem;
-        }
+    .main-title {
+        font-size: 3rem;
+        font-weight: 800;
+        color: #0F172A;
+        margin-bottom: 0;
+    }
 
-        .score-card {
-            padding: 25px;
-            border-radius: 16px;
-            text-align: center;
-            background: #F8FAFC;
-            border: 1px solid #E2E8F0;
-        }
+    .subtitle {
+        font-size: 1.15rem;
+        color: #64748B;
+        margin-bottom: 1.5rem;
+    }
 
-        .score-number {
-            font-size: 3.5rem;
-            font-weight: 800;
-            margin: 0;
-        }
+    .decision-card {
+        padding: 25px;
+        border-radius: 18px;
+        text-align: center;
+        margin: 10px 0 25px 0;
+    }
 
-        .recommendation {
-            font-size: 1.4rem;
-            font-weight: 700;
-            margin-top: 8px;
-        }
+    .score {
+        font-size: 3.5rem;
+        font-weight: 800;
+    }
 
-        .section-title {
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: #0F172A;
-            margin-top: 1.5rem;
-        }
+    .decision {
+        font-size: 1.35rem;
+        font-weight: 700;
+    }
 
-        .risk-box {
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 10px;
-        }
+    .evidence-card {
+        padding: 15px;
+        border-radius: 12px;
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        margin-bottom: 12px;
+    }
 
-        .critical {
-            background: #FEF2F2;
-            border-left: 5px solid #DC2626;
-        }
+    .small-label {
+        color: #64748B;
+        font-size: 0.85rem;
+    }
 
-        .high {
-            background: #FFF7ED;
-            border-left: 5px solid #EA580C;
-        }
-
-        .medium {
-            background: #FFFBEB;
-            border-left: 5px solid #D97706;
-        }
-
-        .low {
-            background: #F0FDF4;
-            border-left: 5px solid #16A34A;
-        }
-
-        .stMetric {
-            background-color: #F8FAFC;
-        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -116,504 +99,511 @@ st.markdown(
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# SESSION STATE
 # ============================================================
 
-def load_analysis_prompt() -> str:
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "documents" not in st.session_state:
+    st.session_state.documents = []
+
+if "index" not in st.session_state:
+    st.session_state.index = None
+
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+
+if "embedding_model" not in st.session_state:
+    st.session_state.embedding_model = None
+
+if "documents_ready" not in st.session_state:
+    st.session_state.documents_ready = False
+
+
+# ============================================================
+# LOAD MODELS
+# ============================================================
+
+@st.cache_resource(show_spinner="Loading embedding model...")
+def load_embedding_model():
+    return SentenceTransformer(EMBEDDING_MODEL)
+
+
+def get_groq_client():
     """
-    Load the AI analysis instructions from requirements_prompt.txt.
+    Get Groq API client from Streamlit secrets.
+
+    Streamlit Cloud:
+        GROQ_API_KEY = "..."
+
+    Local environment:
+        GROQ_API_KEY environment variable
     """
 
-    if not PROMPT_FILE.exists():
-        raise FileNotFoundError(
-            "requirements_prompt.txt was not found."
+    api_key = None
+
+    # Streamlit secrets
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY")
+    except Exception:
+        pass
+
+    # Environment variable fallback
+    if not api_key:
+        api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "GROQ_API_KEY was not found. "
+            "Add it to Streamlit Secrets."
         )
 
-    return PROMPT_FILE.read_text(encoding="utf-8")
+    return Groq(api_key=api_key)
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
-    """
-    Extract text from a PDF while preserving page numbers.
+# ============================================================
+# PDF EXTRACTION
+# ============================================================
 
-    Returns:
-        full_text: Combined text
-        page_count: Number of pages
-    """
+def extract_pdf_pages(
+    uploaded_file,
+    document_type: str,
+) -> List[Dict]:
+
+    pdf_bytes = uploaded_file.getvalue()
 
     try:
-        document = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-        pages = []
-
-        for page_number, page in enumerate(document, start=1):
-            text = page.get_text("text")
-
-            if text.strip():
-                pages.append(
-                    f"\n--- PAGE {page_number} ---\n{text.strip()}"
-                )
-
-        page_count = len(document)
-        document.close()
-
-        return "\n".join(pages), page_count
-
+        document = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf",
+        )
     except Exception as exc:
-        raise RuntimeError(
-            f"Unable to read the PDF: {exc}"
-        ) from exc
+        raise ValueError(
+            f"Could not open {uploaded_file.name}: {exc}"
+        )
+
+    pages = []
+
+    for page_number, page in enumerate(
+        document,
+        start=1,
+    ):
+
+        text = page.get_text("text").strip()
+
+        if not text:
+            continue
+
+        pages.append(
+            {
+                "document": uploaded_file.name,
+                "document_type": document_type,
+                "page": page_number,
+                "text": text,
+            }
+        )
+
+    document.close()
+
+    return pages
 
 
-def clean_json_response(response_text: str) -> str:
-    """
-    Remove Markdown code fences if Gemini returns JSON inside them.
-    """
+# ============================================================
+# TEXT CLEANING
+# ============================================================
 
-    text = response_text.strip()
+def clean_text(text: str) -> str:
 
-    # Remove ```json ... ```
     text = re.sub(
-        r"^```json\s*",
-        "",
+        r"[ \t]+",
+        " ",
         text,
-        flags=re.IGNORECASE,
     )
 
-    # Remove ``` ... ```
     text = re.sub(
-        r"^```\s*",
-        "",
-        text,
-    )
-
-    text = re.sub(
-        r"\s*```$",
-        "",
+        r"\n{3,}",
+        "\n\n",
         text,
     )
 
     return text.strip()
 
 
-def parse_ai_json(response_text: str) -> Dict[str, Any]:
-    """
-    Convert the AI response into a Python dictionary.
-    """
+# ============================================================
+# CHUNKING
+# ============================================================
 
-    cleaned = clean_json_response(response_text)
+def chunk_page(
+    page: Dict,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+) -> List[Dict]:
 
-    try:
-        result = json.loads(cleaned)
+    text = clean_text(page["text"])
 
-        if not isinstance(result, dict):
-            raise ValueError("AI response is not a JSON object.")
+    if len(text) <= chunk_size:
 
-        return result
-
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "The AI returned an invalid JSON response."
-        ) from exc
-
-
-def get_gemini_client() -> genai.Client:
-    """
-    Create a Gemini API client.
-
-    Supports:
-        GEMINI_API_KEY
-        GOOGLE_API_KEY
-    """
-
-    api_key = (
-        os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-    )
-
-    # Streamlit Cloud secrets support
-    if not api_key:
-        try:
-            api_key = (
-                st.secrets.get("GEMINI_API_KEY")
-                or st.secrets.get("GOOGLE_API_KEY")
-            )
-        except Exception:
-            api_key = None
-
-    if not api_key:
-        raise ValueError(
-            "Gemini API key not found. "
-            "Set GEMINI_API_KEY in your .env file "
-            "or Streamlit secrets."
-        )
-
-    return genai.Client(api_key=api_key)
-
-
-def analyze_tender(
-    tender_text: str,
-    company_profile: str,
-    model_name: str,
-) -> Dict[str, Any]:
-    """
-    Send the tender and company profile to Gemini
-    and return structured analysis.
-    """
-
-    client = get_gemini_client()
-
-    instructions = load_analysis_prompt()
-
-    prompt = f"""
-{instructions}
-
-============================================================
-TENDER DOCUMENT
-============================================================
-
-{tender_text}
-
-============================================================
-COMPANY PROFILE
-============================================================
-
-{company_profile}
-
-============================================================
-FINAL INSTRUCTION
-============================================================
-
-Analyze the tender against the company profile.
-
-Return ONLY valid JSON.
-
-Do not use Markdown.
-Do not add explanations outside the JSON.
-Do not invent company capabilities.
-Do not invent tender requirements.
-Use "NEEDS_REVIEW" when the available evidence is insufficient.
-
-The JSON must follow the structure described in the
-analysis instructions.
-"""
-
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-    )
-
-    if not response.text:
-        raise ValueError(
-            "Gemini returned an empty response."
-        )
-
-    return parse_ai_json(response.text)
-
-
-def safe_score(value: Any) -> float:
-    """
-    Convert a value into a score between 0 and 100.
-    """
-
-    try:
-        number = float(value)
-        return max(0.0, min(100.0, number))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def recommendation_color(recommendation: str) -> str:
-    """
-    Return a color for the recommendation.
-    """
-
-    normalized = recommendation.upper()
-
-    if normalized == "BID":
-        return "#16A34A"
-
-    if normalized == "BID WITH CONDITIONS":
-        return "#D97706"
-
-    if normalized == "NO-BID":
-        return "#DC2626"
-
-    return "#64748B"
-
-
-def display_score(score_data: Dict[str, Any]) -> None:
-    """
-    Display the overall readiness score.
-    """
-
-    score = safe_score(
-        score_data.get("overall_score", 0)
-    )
-
-    recommendation = str(
-        score_data.get(
-            "recommendation",
-            "NEEDS REVIEW",
-        )
-    )
-
-    color = recommendation_color(recommendation)
-
-    st.markdown(
-        f"""
-        <div class="score-card">
-            <div style="color:#64748B;">
-                BID READINESS
-            </div>
-
-            <div
-                class="score-number"
-                style="color:{color};"
-            >
-                {score:.0f}%
-            </div>
-
-            <div
-                class="recommendation"
-                style="color:{color};"
-            >
-                {recommendation}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def display_category_scores(
-    score_data: Dict[str, Any]
-) -> None:
-    """
-    Display category-level scores.
-    """
-
-    categories = score_data.get(
-        "category_scores",
-        [],
-    )
-
-    if not categories:
-        return
-
-    st.markdown(
-        '<div class="section-title">Category Scores</div>',
-        unsafe_allow_html=True,
-    )
-
-    columns = st.columns(
-        min(len(categories), 3)
-    )
-
-    for index, category in enumerate(categories):
-
-        column = columns[index % len(columns)]
-
-        name = category.get(
-            "category",
-            "Unknown",
-        )
-
-        score = safe_score(
-            category.get("score", 0)
-        )
-
-        column.metric(
-            label=name,
-            value=f"{score:.0f}%",
-        )
-
-
-def display_requirements(
-    requirements: List[Dict[str, Any]],
-    matches: List[Dict[str, Any]],
-) -> None:
-    """
-    Display the compliance matrix.
-    """
-
-    st.markdown(
-        '<div class="section-title">Compliance Matrix</div>',
-        unsafe_allow_html=True,
-    )
-
-    if not requirements:
-        st.info(
-            "No requirements were identified."
-        )
-        return
-
-    match_lookup = {
-        str(item.get("requirement_id")): item
-        for item in matches
-    }
-
-    rows = []
-
-    for requirement in requirements:
-
-        requirement_id = str(
-            requirement.get(
-                "requirement_id",
-                "",
-            )
-        )
-
-        match = match_lookup.get(
-            requirement_id,
-            {},
-        )
-
-        status = match.get(
-            "status",
-            "NEEDS_REVIEW",
-        )
-
-        rows.append(
+        return [
             {
-                "Requirement": requirement.get(
-                    "title",
-                    "Untitled",
+                **page,
+                "chunk_id": (
+                    f"{page['document']}"
+                    f"-p{page['page']}-c1"
                 ),
-                "Category": requirement.get(
-                    "category",
-                    "Other",
-                ),
-                "Mandatory": (
-                    "Yes"
-                    if requirement.get(
-                        "mandatory",
-                        False,
-                    )
-                    else "No"
-                ),
-                "Status": status,
-                "Explanation": match.get(
-                    "explanation",
-                    "",
-                ),
+                "text": text,
             }
+        ]
+
+    chunks = []
+
+    start = 0
+    chunk_number = 1
+
+    while start < len(text):
+
+        end = min(
+            start + chunk_size,
+            len(text),
         )
 
-    st.dataframe(
-        rows,
-        use_container_width=True,
-        hide_index=True,
-    )
+        chunk_text = text[start:end].strip()
 
+        if chunk_text:
 
-def display_risks(
-    risks: List[Dict[str, Any]]
-) -> None:
-    """
-    Display identified risks.
-    """
-
-    st.markdown(
-        '<div class="section-title">Risks & Gaps</div>',
-        unsafe_allow_html=True,
-    )
-
-    if not risks:
-        st.success(
-            "No significant risks were identified."
-        )
-        return
-
-    for risk in risks:
-
-        level = str(
-            risk.get(
-                "level",
-                "MEDIUM",
-            )
-        ).upper()
-
-        css_class = level.lower()
-
-        title = risk.get(
-            "title",
-            "Untitled Risk",
-        )
-
-        description = risk.get(
-            "description",
-            "",
-        )
-
-        mitigation = risk.get(
-            "mitigation",
-            "",
-        )
-
-        st.markdown(
-            f"""
-            <div class="risk-box {css_class}">
-                <strong>{level}: {title}</strong>
-                <br>
-                {description}
-
+            chunks.append(
                 {
-                    f"<br><br><strong>Mitigation:</strong> {mitigation}"
-                    if mitigation
-                    else ""
+                    **page,
+                    "chunk_id": (
+                        f"{page['document']}"
+                        f"-p{page['page']}"
+                        f"-c{chunk_number}"
+                    ),
+                    "text": chunk_text,
                 }
-            </div>
-            """,
-            unsafe_allow_html=True,
+            )
+
+        if end >= len(text):
+            break
+
+        start = max(
+            end - overlap,
+            start + 1,
         )
 
+        chunk_number += 1
 
-def display_action_plan(
-    actions: List[Dict[str, Any]]
-) -> None:
-    """
-    Display recommended actions.
-    """
+    return chunks
 
-    st.markdown(
-        '<div class="section-title">Action Plan</div>',
-        unsafe_allow_html=True,
+
+def create_chunks(
+    pages: List[Dict],
+) -> List[Dict]:
+
+    all_chunks = []
+
+    for page in pages:
+
+        all_chunks.extend(
+            chunk_page(page)
+        )
+
+    return all_chunks
+
+
+# ============================================================
+# BUILD FAISS INDEX
+# ============================================================
+
+def build_faiss_index(
+    chunks: List[Dict],
+    embedding_model,
+):
+
+    texts = [
+        chunk["text"]
+        for chunk in chunks
+    ]
+
+    embeddings = embedding_model.encode(
+        texts,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
     )
 
-    if not actions:
-        st.info(
-            "No additional actions were generated."
-        )
-        return
+    embeddings = embeddings.astype(
+        "float32"
+    )
 
-    for index, action in enumerate(
-        actions,
+    dimension = embeddings.shape[1]
+
+    index = faiss.IndexFlatIP(
+        dimension
+    )
+
+    index.add(embeddings)
+
+    return index
+
+
+# ============================================================
+# RETRIEVAL
+# ============================================================
+
+def retrieve(
+    query: str,
+    index,
+    chunks: List[Dict],
+    embedding_model,
+    top_k: int = TOP_K,
+) -> List[Dict]:
+
+    if index is None or not chunks:
+        return []
+
+    query_embedding = embedding_model.encode(
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+
+    query_embedding = query_embedding.astype(
+        "float32"
+    )
+
+    scores, indices = index.search(
+        query_embedding,
+        min(top_k, len(chunks)),
+    )
+
+    results = []
+
+    for score, index_number in zip(
+        scores[0],
+        indices[0],
+    ):
+
+        if index_number < 0:
+            continue
+
+        chunk = dict(
+            chunks[index_number]
+        )
+
+        chunk["similarity"] = float(score)
+
+        results.append(chunk)
+
+    return results
+
+
+# ============================================================
+# FORMAT RETRIEVED EVIDENCE
+# ============================================================
+
+def format_context(
+    results: List[Dict],
+) -> str:
+
+    if not results:
+        return "No relevant evidence was retrieved."
+
+    sections = []
+
+    for number, result in enumerate(
+        results,
         start=1,
     ):
 
-        priority = action.get(
-            "priority",
-            "MEDIUM",
-        )
-
-        title = action.get(
-            "title",
-            "Action",
-        )
-
-        description = action.get(
-            "description",
-            "",
-        )
-
-        st.markdown(
+        sections.append(
             f"""
-            **{index}. {title}**
-            
-            `{priority}` — {description}
-            """
+[EVIDENCE {number}]
+Document: {result['document']}
+Document Type: {result['document_type']}
+Page: {result['page']}
+Similarity: {result['similarity']:.3f}
+
+Content:
+{result['text']}
+"""
         )
+
+    return "\n".join(sections)
+
+
+# ============================================================
+# GROQ ANALYSIS
+# ============================================================
+
+def analyze_with_groq(
+    question: str,
+    company_profile: str,
+    retrieved_results: List[Dict],
+) -> str:
+
+    client = get_groq_client()
+
+    context = format_context(
+        retrieved_results
+    )
+
+    system_prompt = """
+You are BidReady AI, an expert tender-readiness assistant.
+
+Your job is to help a company determine whether a tender appears
+suitable for them.
+
+You MUST follow these rules:
+
+1. Use the retrieved evidence as your primary source.
+2. Do not invent tender requirements.
+3. Do not invent company capabilities.
+4. If the evidence is insufficient, say NEEDS REVIEW.
+5. Distinguish between:
+   - Match
+   - Partial Match
+   - Gap
+   - Needs Review
+6. Pay special attention to mandatory requirements.
+7. Cite evidence using document name and page number.
+8. Never fabricate a page number.
+9. Be conservative about bid recommendations.
+10. Explain your reasoning clearly.
+
+For suitability questions, consider:
+
+- Eligibility
+- Technical capability
+- Relevant experience
+- Certifications
+- Registrations
+- Financial requirements
+- Documentation
+- Geographic requirements
+- Deadlines
+- Mandatory conditions
+
+If a mandatory requirement appears to be missing,
+highlight it prominently.
+
+A high number of matches does NOT automatically mean the tender
+is suitable if an important mandatory requirement is missing.
+
+Possible recommendations:
+
+BID
+BID WITH CONDITIONS
+NO-BID
+NEEDS REVIEW
+"""
+
+    user_prompt = f"""
+COMPANY PROFILE
+================
+
+{company_profile}
+
+
+USER QUESTION
+================
+
+{question}
+
+
+RETRIEVED TENDER / COMPANY EVIDENCE
+=====================================
+
+{context}
+
+
+TASK
+================
+
+Answer the user's question using the evidence above.
+
+When appropriate, structure your response as:
+
+1. Direct Answer
+2. Readiness Assessment
+3. Matching Requirements
+4. Gaps / Risks
+5. Evidence
+6. Recommended Next Steps
+
+If you cannot confidently determine suitability from the available
+evidence, say NEEDS REVIEW rather than guessing.
+"""
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+        temperature=0.1,
+        max_tokens=2500,
+    )
+
+    return response.choices[0].message.content
+
+
+# ============================================================
+# DOCUMENT INGESTION
+# ============================================================
+
+def process_documents(
+    tender_file,
+    company_file,
+):
+
+    all_pages = []
+
+    tender_pages = extract_pdf_pages(
+        tender_file,
+        "Tender",
+    )
+
+    company_pages = extract_pdf_pages(
+        company_file,
+        "Company Profile",
+    )
+
+    all_pages.extend(
+        tender_pages
+    )
+
+    all_pages.extend(
+        company_pages
+    )
+
+    if not all_pages:
+        raise ValueError(
+            "No readable text was found in the uploaded PDFs."
+        )
+
+    chunks = create_chunks(
+        all_pages
+    )
+
+    embedding_model = load_embedding_model()
+
+    index = build_faiss_index(
+        chunks,
+        embedding_model,
+    )
+
+    return (
+        all_pages,
+        chunks,
+        index,
+    )
 
 
 # ============================================================
@@ -628,11 +618,16 @@ st.markdown(
 st.markdown(
     """
     <div class="subtitle">
-        Know Before You Bid — AI-powered tender intelligence
-        and bid-readiness analysis.
+        Know Before You Bid — RAG-powered tender intelligence
+        for businesses.
     </div>
     """,
     unsafe_allow_html=True,
+)
+
+st.write(
+    "Upload your company profile and tender, then ask questions "
+    "about eligibility, requirements, risks, and bid suitability."
 )
 
 
@@ -642,342 +637,345 @@ st.markdown(
 
 with st.sidebar:
 
-    st.header("⚙️ Settings")
+    st.header("⚙️ Configuration")
 
-    model_name = st.text_input(
-        "Gemini Model",
-        value="gemini-2.5-flash",
-        help="Gemini model used for tender analysis.",
+    st.info(
+        "This application uses:\n\n"
+        "• PyMuPDF for PDF extraction\n"
+        "• Sentence Transformers for embeddings\n"
+        "• FAISS for vector retrieval\n"
+        "• Groq for LLM reasoning"
     )
 
     st.divider()
 
-    st.markdown("### How it works")
+    st.subheader("Required API Key")
 
-    st.markdown(
-        """
-        1. Upload a tender PDF
-        2. Enter company information
-        3. BidReady AI extracts requirements
-        4. Requirements are compared with the company
-        5. Risks and gaps are identified
-        6. A readiness score is calculated
-        7. Bid/no-bid recommendation is generated
-        """
+    st.code(
+        "GROQ_API_KEY",
+        language="text",
     )
-
-    st.divider()
 
     st.caption(
-        "BidReady AI provides AI-assisted analysis "
-        "and should not be treated as legal or official "
-        "tender eligibility advice."
+        "Add your Groq API key through Streamlit "
+        "Cloud Secrets."
+    )
+
+    st.divider()
+
+    if st.session_state.documents_ready:
+
+        st.success(
+            "Knowledge base ready"
+        )
+
+        st.metric(
+            "Indexed chunks",
+            len(
+                st.session_state.chunks
+            ),
+        )
+
+    else:
+
+        st.warning(
+            "Upload both PDFs to build the knowledge base."
+        )
+
+
+# ============================================================
+# DOCUMENT UPLOAD
+# ============================================================
+
+st.header("📄 1. Upload Documents")
+
+col1, col2 = st.columns(2)
+
+with col1:
+
+    tender_file = st.file_uploader(
+        "Tender / RFP PDF",
+        type=["pdf"],
+        key="tender_pdf",
+        help=(
+            "Upload the tender you want to evaluate."
+        ),
+    )
+
+with col2:
+
+    company_file = st.file_uploader(
+        "Company Profile PDF",
+        type=["pdf"],
+        key="company_pdf",
+        help=(
+            "Upload your company's profile, "
+            "capabilities, experience, certifications, etc."
+        ),
     )
 
 
 # ============================================================
-# INPUT SECTION
+# BUILD KNOWLEDGE BASE
 # ============================================================
 
-st.header("1. Tender Document")
+if tender_file and company_file:
 
-uploaded_file = st.file_uploader(
-    "Upload tender PDF",
-    type=["pdf"],
-    help="Upload a searchable/text-based tender PDF.",
-)
+    if st.button(
+        "🔎 Build BidReady Knowledge Base",
+        type="primary",
+        use_container_width=True,
+    ):
 
+        with st.spinner(
+            "Extracting PDFs, creating chunks, "
+            "generating embeddings, and building FAISS index..."
+        ):
 
-st.header("2. Company Profile")
+            try:
 
-company_profile = st.text_area(
-    "Enter company information",
-    height=250,
-    placeholder=(
-        "Example:\n\n"
-        "Company Name: ABC Engineering Pvt Ltd\n"
-        "Industry: Engineering & Construction\n"
-        "Years of Experience: 7\n"
-        "Certifications: ISO 9001, PEC Registration\n"
-        "Past Projects: 3 government infrastructure projects\n"
-        "Capabilities: Mechanical works, industrial installation, maintenance\n"
-        "Financial Capacity: PKR 100 million annual turnover\n"
-        "Geographic Coverage: Pakistan"
-    ),
-)
+                pages, chunks, index = process_documents(
+                    tender_file,
+                    company_file,
+                )
+
+                st.session_state.documents = pages
+                st.session_state.chunks = chunks
+                st.session_state.index = index
+                st.session_state.embedding_model = (
+                    load_embedding_model()
+                )
+                st.session_state.documents_ready = True
+
+                # Clear previous conversation when
+                # new documents are uploaded.
+                st.session_state.messages = []
+
+                st.success(
+                    f"Knowledge base created successfully. "
+                    f"{len(chunks)} chunks indexed."
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    f"Could not build knowledge base: {exc}"
+                )
 
 
 # ============================================================
-# ANALYZE BUTTON
+# DOCUMENT SUMMARY
+# ============================================================
+
+if st.session_state.documents_ready:
+
+    st.header("📚 Knowledge Base")
+
+    tender_pages_count = sum(
+        1
+        for item in st.session_state.documents
+        if item["document_type"] == "Tender"
+    )
+
+    company_pages_count = sum(
+        1
+        for item in st.session_state.documents
+        if item["document_type"] == "Company Profile"
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Tender pages",
+        tender_pages_count,
+    )
+
+    col2.metric(
+        "Company profile pages",
+        company_pages_count,
+    )
+
+    col3.metric(
+        "Indexed chunks",
+        len(st.session_state.chunks),
+    )
+
+    with st.expander(
+        "🔍 View indexed document information"
+    ):
+
+        st.dataframe(
+            [
+                {
+                    "Document": item["document"],
+                    "Type": item["document_type"],
+                    "Page": item["page"],
+                }
+                for item in st.session_state.documents
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# ============================================================
+# CHAT / QUESTIONS
+# ============================================================
+
+if st.session_state.documents_ready:
+
+    st.divider()
+
+    st.header("💬 2. Ask BidReady AI")
+
+    st.caption(
+        "Ask whether the tender is suitable, what requirements "
+        "you meet, what gaps exist, or what you should do before bidding."
+    )
+
+    example_questions = [
+        "Is this tender suitable for my company?",
+        "What mandatory requirements does my company fail to meet?",
+        "Which tender requirements does my company satisfy?",
+        "What are the biggest risks if we bid?",
+        "Do we have enough relevant experience?",
+        "What certifications are required?",
+        "What documents are missing?",
+        "Should we BID, BID WITH CONDITIONS, or NO-BID?",
+    ]
+
+    selected_question = st.selectbox(
+        "Example questions",
+        ["Choose a question..."]
+        + example_questions,
+    )
+
+    question = st.chat_input(
+        "Ask BidReady AI a question..."
+    )
+
+    if (
+        not question
+        and selected_question != "Choose a question..."
+    ):
+        question = selected_question
+
+    if question:
+
+        # Display user question
+        st.chat_message(
+            "user"
+        ).write(question)
+
+        with st.spinner(
+            "Retrieving evidence and analyzing suitability..."
+        ):
+
+            try:
+
+                embedding_model = (
+                    st.session_state.embedding_model
+                )
+
+                results = retrieve(
+                    query=question,
+                    index=st.session_state.index,
+                    chunks=st.session_state.chunks,
+                    embedding_model=embedding_model,
+                    top_k=TOP_K,
+                )
+
+                # Build company profile from all company chunks
+                company_chunks = [
+                    chunk
+                    for chunk in st.session_state.chunks
+                    if chunk["document_type"]
+                    == "Company Profile"
+                ]
+
+                company_profile = "\n\n".join(
+                    chunk["text"]
+                    for chunk in company_chunks
+                )
+
+                answer = analyze_with_groq(
+                    question=question,
+                    company_profile=company_profile,
+                    retrieved_results=results,
+                )
+
+                st.session_state.messages.append(
+                    {
+                        "question": question,
+                        "answer": answer,
+                    }
+                )
+
+                st.chat_message(
+                    "assistant"
+                ).markdown(answer)
+
+                # ----------------------------------------
+                # RETRIEVED EVIDENCE
+                # ----------------------------------------
+
+                with st.expander(
+                    f"🔎 Retrieved Evidence ({len(results)} chunks)"
+                ):
+
+                    for number, result in enumerate(
+                        results,
+                        start=1,
+                    ):
+
+                        st.markdown(
+                            f"""
+                            <div class="evidence-card">
+
+                            <strong>
+                            Evidence {number}
+                            </strong>
+
+                            <br>
+
+                            <span class="small-label">
+                            {result['document']}
+                            • Page {result['page']}
+                            • Similarity {result['similarity']:.3f}
+                            </span>
+
+                            <br><br>
+
+                            {result['text']}
+
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+            except Exception as exc:
+
+                st.error(
+                    f"Analysis failed: {exc}"
+                )
+
+else:
+
+    st.info(
+        "👆 Upload both a tender PDF and a company profile PDF, "
+        "then build the knowledge base."
+    )
+
+
+# ============================================================
+# FOOTER
 # ============================================================
 
 st.divider()
 
-analyze_button = st.button(
-    "🚀 Analyze Tender",
-    type="primary",
-    use_container_width=True,
+st.caption(
+    "BidReady AI is an AI-assisted decision-support tool. "
+    "Always verify important requirements against the original "
+    "tender documentation before making a final bid decision."
 )
-
-
-# ============================================================
-# ANALYSIS
-# ============================================================
-
-if analyze_button:
-
-    if uploaded_file is None:
-
-        st.error(
-            "Please upload a tender PDF first."
-        )
-
-        st.stop()
-
-    if not company_profile.strip():
-
-        st.error(
-            "Please enter the company profile."
-        )
-
-        st.stop()
-
-    with st.spinner(
-        "Extracting tender and analyzing requirements..."
-    ):
-
-        try:
-
-            # --------------------------------------------
-            # PDF EXTRACTION
-            # --------------------------------------------
-
-            pdf_bytes = uploaded_file.getvalue()
-
-            tender_text, page_count = extract_pdf_text(
-                pdf_bytes
-            )
-
-            if not tender_text.strip():
-
-                st.error(
-                    "No readable text was found in this PDF. "
-                    "Please upload a searchable PDF."
-                )
-
-                st.stop()
-
-            # --------------------------------------------
-            # AI ANALYSIS
-            # --------------------------------------------
-
-            result = analyze_tender(
-                tender_text=tender_text,
-                company_profile=company_profile,
-                model_name=model_name,
-            )
-
-            # Store result for the current session
-            st.session_state["analysis"] = result
-            st.session_state["page_count"] = page_count
-            st.session_state["file_name"] = uploaded_file.name
-
-        except Exception as exc:
-
-            st.error(
-                f"Analysis failed: {exc}"
-            )
-
-            st.info(
-                "Check your Gemini API key, PDF, model name, "
-                "and requirements_prompt.txt file."
-            )
-
-            st.stop()
-
-
-# ============================================================
-# DISPLAY RESULTS
-# ============================================================
-
-if "analysis" in st.session_state:
-
-    result = st.session_state["analysis"]
-
-    page_count = st.session_state.get(
-        "page_count",
-        0,
-    )
-
-    file_name = st.session_state.get(
-        "file_name",
-        "Tender",
-    )
-
-    st.divider()
-
-    st.header("📊 Bid Readiness Analysis")
-
-    st.caption(
-        f"Document: {file_name} • "
-        f"{page_count} pages"
-    )
-
-    # --------------------------------------------
-    # EXECUTIVE SUMMARY
-    # --------------------------------------------
-
-    summary = result.get(
-        "executive_summary"
-    )
-
-    if summary:
-
-        st.markdown(
-            '<div class="section-title">Executive Summary</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.info(summary)
-
-    # --------------------------------------------
-    # SCORE
-    # --------------------------------------------
-
-    score_data = result.get(
-        "readiness_score",
-        {},
-    )
-
-    if isinstance(score_data, dict):
-
-        display_score(score_data)
-
-        st.write("")
-
-        display_category_scores(
-            score_data
-        )
-
-        explanation = score_data.get(
-            "explanation"
-        )
-
-        if explanation:
-
-            st.markdown(
-                "**Scoring Explanation:**"
-            )
-
-            st.write(explanation)
-
-    # --------------------------------------------
-    # KEY COUNTS
-    # --------------------------------------------
-
-    requirements = result.get(
-        "requirements",
-        [],
-    )
-
-    matches = result.get(
-        "matches",
-        [],
-    )
-
-    risks = result.get(
-        "risks",
-        [],
-    )
-
-    actions = result.get(
-        "action_plan",
-        [],
-    )
-
-    mandatory_gaps = score_data.get(
-        "mandatory_gaps",
-        0,
-    )
-
-    critical_risks = score_data.get(
-        "critical_risks",
-        0,
-    )
-
-    st.divider()
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Requirements",
-        len(requirements),
-    )
-
-    col2.metric(
-        "Matches",
-        sum(
-            1
-            for item in matches
-            if item.get("status") == "MATCH"
-        ),
-    )
-
-    col3.metric(
-        "Mandatory Gaps",
-        mandatory_gaps,
-    )
-
-    col4.metric(
-        "Critical Risks",
-        critical_risks,
-    )
-
-    # --------------------------------------------
-    # COMPLIANCE MATRIX
-    # --------------------------------------------
-
-    display_requirements(
-        requirements,
-        matches,
-    )
-
-    # --------------------------------------------
-    # RISKS
-    # --------------------------------------------
-
-    display_risks(risks)
-
-    # --------------------------------------------
-    # ACTION PLAN
-    # --------------------------------------------
-
-    display_action_plan(actions)
-
-    # --------------------------------------------
-    # RAW JSON
-    # --------------------------------------------
-
-    with st.expander(
-        "🔍 View Full AI Analysis (JSON)"
-    ):
-
-        st.json(result)
-
-    # --------------------------------------------
-    # DOWNLOAD
-    # --------------------------------------------
-
-    json_download = json.dumps(
-        result,
-        indent=2,
-        ensure_ascii=False,
-    )
-
-    st.download_button(
-        label="⬇️ Download Analysis",
-        data=json_download,
-        file_name="bidready_analysis.json",
-        mime="application/json",
-        use_container_width=True,
-    )
+```
