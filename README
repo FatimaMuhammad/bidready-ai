@@ -1,77 +1,300 @@
-````markdown
 # 🎯 BidReady AI
 
-## Know Before You Bid.
+### **Know Before You Bid.**
 
-BidReady AI is a Retrieval-Augmented Generation (RAG) application that helps businesses evaluate whether a tender appears suitable for their company.
+BidReady AI is an AI-powered **Retrieval-Augmented Generation (RAG)** application designed to help businesses evaluate tender opportunities against their company capabilities.
 
-Users upload:
+The application allows users to upload a **tender/RFP PDF** and a **company profile PDF**, then ask questions about eligibility, requirements, experience, certifications, risks, compliance gaps, and overall bid suitability.
 
-1. A tender / RFP PDF
-2. A company profile PDF
-
-They can then ask questions such as:
-
-> Is this tender suitable for my company?
-
-> What mandatory requirements do we fail?
-
-> What experience is required?
-
-> What are our biggest risks?
-
-> Should we BID, BID WITH CONDITIONS, or NO-BID?
+Instead of asking an LLM to analyze an entire document blindly, BidReady AI uses **semantic retrieval with FAISS and Sentence Transformers** to identify relevant evidence before sending it to the language model.
 
 ---
 
-# 🧠 How BidReady AI Works
+## 🚀 Key Features
 
-The application uses a RAG pipeline:
+* 📄 Tender/RFP PDF ingestion
+* 🏢 Company profile PDF ingestion
+* 🔎 Semantic document retrieval
+* 🧠 Retrieval-Augmented Generation (RAG)
+* ⚡ FAISS vector similarity search
+* 🤖 Groq-powered LLM inference
+* 📊 Bid-readiness assessment
+* ✅ Requirement-to-company matching
+* ⚠️ Risk and gap identification
+* 📋 Compliance analysis
+* 💬 Natural-language questions about the tender
+* 📌 Evidence-based responses
+* 🎯 BID / BID WITH CONDITIONS / NO-BID / NEEDS REVIEW recommendations
+* 🌐 Streamlit web interface
+
+---
+
+# 🧠 How It Works
+
+BidReady AI follows a document-grounded RAG architecture.
 
 ```text
-Tender PDF
-      +
-Company Profile PDF
+                 ┌────────────────────┐
+                 │    Tender PDF      │
+                 └─────────┬──────────┘
+                           │
+                 ┌─────────▼──────────┐
+                 │  Company Profile   │
+                 │       PDF          │
+                 └─────────┬──────────┘
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │    PyMuPDF      │
+                  │ PDF Extraction  │
+                  └────────┬────────┘
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │    Chunking     │
+                  │ + Page Metadata │
+                  └────────┬────────┘
+                           │
+                           ▼
+               ┌────────────────────────┐
+               │ Sentence Transformers  │
+               │  Semantic Embeddings   │
+               └────────────┬───────────┘
+                            │
+                            ▼
+                     ┌────────────┐
+                     │    FAISS   │
+                     │ Vector Index│
+                     └──────┬─────┘
+                            │
+                     User Question
+                            │
+                            ▼
+                  ┌─────────────────┐
+                  │ Semantic Search │
+                  │ Top-K Retrieval │
+                  └────────┬────────┘
+                           │
+                           ▼
+                  Retrieved Evidence
+                           │
+                           ▼
+               ┌────────────────────────┐
+               │        Groq LLM        │
+               │    openai/gpt-oss-20b  │
+               └────────────┬───────────┘
+                            │
+                            ▼
+                  ┌─────────────────┐
+                  │ Grounded Answer │
+                  └────────┬────────┘
+                           │
+                           ▼
+                Bid Suitability Insight
+```
+
+---
+
+# 🔍 RAG Architecture
+
+## 1. Document Ingestion
+
+The user uploads two PDF documents:
+
+```text
+Tender / RFP
+Company Profile
+```
+
+PyMuPDF extracts the text while retaining document and page information.
+
+Each extracted section is associated with metadata such as:
+
+```text
+document_type
+page_number
+chunk_id
+text
+```
+
+This allows the application to trace retrieved information back to the source document.
+
+---
+
+## 2. Text Chunking
+
+Long documents are divided into smaller overlapping chunks.
+
+Conceptually:
+
+```text
+PDF
+ ↓
+Pages
+ ↓
+Text
+ ↓
+Chunks
+```
+
+Smaller chunks improve semantic retrieval because the vector search can identify the specific section relevant to the user's question.
+
+---
+
+## 3. Semantic Embeddings
+
+Each text chunk is converted into a numerical vector using:
+
+```text
+sentence-transformers/all-MiniLM-L6-v2
+```
+
+The embedding represents the semantic meaning of the text rather than relying only on exact keyword matching.
+
+For example:
+
+```text
+"What certifications are mandatory?"
+```
+
+can retrieve relevant text containing:
+
+```text
+"The bidder shall possess ISO 9001 certification..."
+```
+
+even when the wording is different.
+
+---
+
+## 4. FAISS Vector Search
+
+The generated embeddings are indexed using **FAISS**.
+
+When a user asks a question:
+
+```text
+User Question
       ↓
-   PyMuPDF
+Question Embedding
       ↓
-Text Extraction
+FAISS Similarity Search
       ↓
-Chunking
-      ↓
-Sentence Transformers
-      ↓
-Semantic Embeddings
-      ↓
-FAISS Vector Index
-      ↓
-Relevant Evidence Retrieval
-      ↓
-Groq
+Relevant Document Chunks
+```
+
+Only the most relevant retrieved evidence is passed to the LLM.
+
+---
+
+## 5. Grounded LLM Reasoning
+
+The retrieved tender and company evidence is provided to the Groq-hosted model:
+
+```text
 openai/gpt-oss-20b
-      ↓
-AI Reasoning
-      ↓
-Bid Suitability Answer
-````
+```
+
+The model is instructed to base its answer on the retrieved evidence and clearly indicate when sufficient evidence is unavailable.
+
+This reduces the risk of unsupported assumptions and hallucinated requirements.
 
 ---
 
-# 🛠️ Technology Stack
+# 💬 Example Questions
 
-| Technology            | Purpose                  |
-| --------------------- | ------------------------ |
-| Streamlit             | Web application          |
-| PyMuPDF               | PDF text extraction      |
-| Sentence Transformers | Semantic embeddings      |
-| FAISS                 | Vector similarity search |
-| Groq                  | LLM inference            |
-| `openai/gpt-oss-20b`  | AI reasoning             |
-| Python                | Application logic        |
+Users can ask questions such as:
+
+```text
+Is this tender suitable for my company?
+
+Should we bid on this tender?
+
+What mandatory requirements must we satisfy?
+
+Which mandatory requirements do we currently fail?
+
+Which requirements does our company satisfy?
+
+Do we have the required experience?
+
+What certifications are required?
+
+What registrations are required?
+
+What financial requirements are specified?
+
+What documents are required for submission?
+
+What are the biggest compliance gaps?
+
+What are the major risks?
+
+What should we do before submitting the bid?
+```
 
 ---
 
-# 📂 Project Structure
+# 🎯 Bid Suitability Assessment
+
+BidReady AI evaluates the available evidence across areas such as:
+
+| Area                 | Assessment                               |
+| -------------------- | ---------------------------------------- |
+| Eligibility          | Required eligibility conditions          |
+| Technical Capability | Required technical capabilities          |
+| Experience           | Relevant project and industry experience |
+| Certifications       | Required certifications                  |
+| Registrations        | Required licenses/registrations          |
+| Financial Capacity   | Financial and turnover requirements      |
+| Documentation        | Required submission documents            |
+| Geography            | Location or geographic requirements      |
+| Deadlines            | Important submission dates               |
+| Mandatory Conditions | Potentially disqualifying requirements   |
+
+---
+
+# 📊 Recommendation Framework
+
+The application can provide four high-level outcomes.
+
+### 🟢 BID
+
+The available evidence indicates that the company appears capable of satisfying the important tender requirements.
+
+### 🟡 BID WITH CONDITIONS
+
+The company appears potentially suitable, but one or more important gaps, uncertainties, or risks should be addressed before bidding.
+
+### 🔴 NO-BID
+
+The available evidence indicates a significant mandatory or potentially disqualifying requirement that the company does not appear to satisfy.
+
+### ⚪ NEEDS REVIEW
+
+The available documents do not provide enough reliable evidence to make a confident recommendation.
+
+> **Important:** These recommendations are decision-support outputs, not official tender eligibility determinations.
+
+---
+
+# 🏗️ Technology Stack
+
+| Technology                    | Role                     |
+| ----------------------------- | ------------------------ |
+| **Python**                    | Application logic        |
+| **Streamlit**                 | Web application and UI   |
+| **PyMuPDF**                   | PDF text extraction      |
+| **Sentence Transformers**     | Semantic embeddings      |
+| **FAISS**                     | Vector similarity search |
+| **Groq**                      | LLM inference            |
+| **openai/gpt-oss-20b**        | Language model           |
+| **GitHub**                    | Source-code repository   |
+| **Streamlit Community Cloud** | Application deployment   |
+
+---
+
+# 📁 Project Structure
 
 ```text
 bidready-ai/
@@ -79,222 +302,231 @@ bidready-ai/
 ├── app.py
 ├── requirements.txt
 ├── README.md
-└── .gitignore
+├── .gitignore
+│
+└── .streamlit/
+    └── config.toml
 ```
+
+> API credentials and private documents should never be committed to the repository.
 
 ---
 
-# 🔍 RAG Pipeline
+# 🔐 API Key & Secrets
 
-## 1. Document ingestion
+BidReady AI requires a **Groq API credential** for LLM inference.
 
-The user uploads:
+### Never place the credential directly inside `app.py`.
 
-```text
-Tender.pdf
-Company_Profile.pdf
+Do **not** write:
+
+```python
+GROQ_API_KEY = "your-secret-key"
 ```
 
-PyMuPDF extracts text while preserving page numbers.
+Do not commit `.env`, API credentials, private PDFs, or other secrets to GitHub.
+
+For Streamlit Community Cloud, the credential should be configured through the application's **Secrets** configuration.
+
+The application can access it at runtime through Streamlit's secrets mechanism.
+
+The secret remains outside the GitHub source repository.
 
 ---
 
-## 2. Chunking
+# 🌐 Deployment
 
-Large PDF pages are divided into smaller overlapping text chunks.
-
-Each chunk stores metadata:
+BidReady AI is designed to be deployed using:
 
 ```text
-document
-document_type
-page
-chunk_id
-text
-```
-
----
-
-## 3. Embeddings
-
-Sentence Transformers converts each chunk into a semantic vector.
-
-The application uses:
-
-```text
-sentence-transformers/all-MiniLM-L6-v2
-```
-
----
-
-## 4. FAISS
-
-The embeddings are stored in a FAISS vector index.
-
-When the user asks a question:
-
-```text
-Question
+GitHub
    ↓
-Embedding
-   ↓
-FAISS similarity search
-   ↓
-Top relevant chunks
-```
-
----
-
-## 5. Groq
-
-The retrieved evidence is passed to:
-
-```text
-openai/gpt-oss-20b
-```
-
-The model is instructed to reason only from the available evidence.
-
----
-
-# 💬 Example Questions
-
-Users can ask:
-
-```text
-Is this tender suitable for my company?
-
-What mandatory requirements do we fail?
-
-Which requirements do we satisfy?
-
-Do we have enough relevant experience?
-
-What certifications are required?
-
-What documents are missing?
-
-What are the biggest risks?
-
-Should we BID, BID WITH CONDITIONS, or NO-BID?
-```
-
----
-
-# 📊 Suitability Logic
-
-BidReady AI considers:
-
-* Eligibility
-* Technical capability
-* Relevant experience
-* Certifications
-* Registrations
-* Financial requirements
-* Documentation
-* Geographic requirements
-* Deadlines
-* Mandatory conditions
-
-The assistant uses four recommendation categories:
-
-### BID
-
-The company appears to satisfy the important requirements.
-
-### BID WITH CONDITIONS
-
-The company appears potentially suitable, but important gaps or risks should be addressed.
-
-### NO-BID
-
-A significant mandatory or potentially disqualifying requirement appears not to be satisfied.
-
-### NEEDS REVIEW
-
-There is insufficient evidence to make a reliable recommendation.
-
----
-
-# 🔐 API Key
-
-The application requires a Groq API key.
-
-The key should NEVER be committed to GitHub.
-
-For Streamlit Community Cloud, configure:
-
-```text
-GROQ_API_KEY = "your-groq-api-key"
-```
-
-through the application's Secrets settings.
-
----
-
-# 🚀 Deployment
-
-BidReady AI can be deployed directly from GitHub to Streamlit Community Cloud.
-
-No local Python installation is required for deployment.
-
-No Google Colab is required.
-
-No VS Code is required.
-
-No terminal is required.
-
-Basic workflow:
-
-```text
-Create GitHub Repository
-        ↓
-Add app.py
-        ↓
-Add requirements.txt
-        ↓
-Add README.md
-        ↓
-Add .gitignore
-        ↓
 Streamlit Community Cloud
-        ↓
-Connect GitHub
-        ↓
-Select Repository
-        ↓
-Select app.py
-        ↓
-Add GROQ_API_KEY
-        ↓
-Deploy
+   ↓
+Public Web Application
+```
+
+The deployment process does not require Google Colab, VS Code, or a local terminal.
+
+### High-level deployment workflow
+
+```text
+1. Create GitHub repository
+            ↓
+2. Upload project files
+            ↓
+3. Open Streamlit Community Cloud
+            ↓
+4. Connect GitHub account
+            ↓
+5. Select repository
+            ↓
+6. Select app.py
+            ↓
+7. Configure GROQ_API_KEY
+   through Streamlit Secrets
+            ↓
+8. Deploy application
+            ↓
+9. Open generated Streamlit URL
 ```
 
 ---
 
-# ⚠️ Important Limitations
+# 🔒 Security & Privacy
 
-BidReady AI is an AI-assisted decision-support system.
+### Source-code security
 
-It does not:
+The GitHub repository should contain application source code only.
+
+Never commit:
+
+```text
+.env
+API keys
+private credentials
+company documents
+confidential tenders
+secret configuration files
+```
+
+### Document privacy
+
+Tender and company documents may contain commercially sensitive information.
+
+Users should only upload documents to an environment they are authorized to use.
+
+BidReady AI should be treated as an **AI-assisted decision-support application**, not as a secure document-management system.
+
+---
+
+# ⚠️ Limitations
+
+BidReady AI is intended to assist with preliminary tender evaluation.
+
+It does **not**:
 
 * Guarantee tender eligibility
 * Guarantee bid success
-* Replace legal advice
 * Replace procurement professionals
-* Automatically submit tenders
-* Guarantee that every requirement is retrieved
-* Guarantee that AI reasoning is always correct
+* Replace legal or financial advice
+* Automatically submit a tender
+* Guarantee complete extraction from every PDF
+* Guarantee that every relevant requirement is retrieved
+* Guarantee that AI-generated reasoning is always correct
+* Replace verification against the original tender document
 
-Important requirements should always be verified against the original tender.
+For important decisions, users should verify the relevant requirement against the original tender documentation.
 
 ---
 
-# 🔒 Privacy
+# 🧪 Example Use Case
 
-Do not upload confidential company or tender documents to a public GitHub repository.
+### Input
 
-Uploaded documents are processed in the application and are not intended to be committed to source control.
+A company uploads:
+
+```text
+Tender_RFP.pdf
+Company_Profile.pdf
+```
+
+The user asks:
+
+> **Is this tender suitable for my company?**
+
+The RAG pipeline retrieves relevant evidence concerning:
+
+```text
+Tender:
+- Minimum experience
+- Required certifications
+- Financial capacity
+- Technical requirements
+
+Company:
+- Years of experience
+- Certifications
+- Previous projects
+- Financial capacity
+- Technical capabilities
+```
+
+The LLM then compares the retrieved evidence and produces an explanation such as:
+
+```text
+Recommendation:
+BID WITH CONDITIONS
+
+Strengths:
+✓ Required technical capability
+✓ Required years of experience
+✓ Relevant previous projects
+
+Gaps:
+⚠ Required certification evidence is incomplete
+
+Risk:
+Medium
+
+Suggested Action:
+Verify certification documentation before bid submission.
+```
+
+The exact result depends on the documents supplied by the user.
+
+---
+
+# 🧭 Design Principles
+
+BidReady AI follows several important principles:
+
+### 1. Retrieval before reasoning
+
+The LLM should receive relevant document evidence rather than relying solely on its general knowledge.
+
+### 2. Evidence over assumptions
+
+The system should distinguish between:
+
+```text
+MATCH
+PARTIAL
+GAP
+NEEDS REVIEW
+```
+
+rather than inventing missing company information.
+
+### 3. Source awareness
+
+Retrieved chunks retain document/page metadata so that important findings can be traced back to the source material.
+
+### 4. Decision support, not autonomous bidding
+
+BidReady AI assists the user in evaluating an opportunity. The final bidding decision remains with the business.
+
+---
+
+# 🔮 Future Improvements
+
+Potential future versions could include:
+
+* Advanced document reranking
+* OCR support for scanned PDFs
+* Hybrid keyword + semantic retrieval
+* Better citation rendering
+* Requirement classification
+* Automated compliance matrices
+* Multi-tender comparison
+* Tender deadline tracking
+* Company document libraries
+* Historical bid analysis
+* Bid/no-bid analytics
+* User authentication
+* Persistent vector databases
+* Enterprise document security
+* Human-in-the-loop approval workflows
 
 ---
 
@@ -302,9 +534,16 @@ Uploaded documents are processed in the application and are not intended to be c
 
 ## BidReady AI
 
-### Know Before You Bid.
+### **Know Before You Bid.**
 
-Built as an AI/RAG application for tender intelligence and bid-readiness analysis.
+An AI-powered RAG application for **tender intelligence, requirement analysis, company-to-tender matching, and bid-readiness assessment**.
 
-```
-```
+---
+
+## 📜 Disclaimer
+
+BidReady AI provides AI-assisted analysis for informational and decision-support purposes only.
+
+Users remain responsible for independently verifying tender requirements, eligibility conditions, documentation, deadlines, and other obligations against the official tender documents.
+
+**BidReady AI does not provide legal, financial, procurement, or official tender eligibility advice.**
