@@ -1,7 +1,8 @@
+import json
 import os
 import re
 import time
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import streamlit as st
@@ -41,6 +42,32 @@ TOP_K = 6
 
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
+
+# Fixed rubric for the Bid Readiness Report. Kept small and fixed
+# (rather than LLM-invented) so the score is comparable across tenders.
+REPORT_CATEGORIES = [
+    "Eligibility",
+    "Technical Match",
+    "Documentation",
+    "Experience",
+    "Certifications",
+]
+
+REPORT_EVIDENCE_PER_CATEGORY = 5
+REPORT_EVIDENCE_MAX_TOTAL = 25
+
+STATUS_COLORS = {
+    "On track": "#16A34A",
+    "Needs attention": "#D97706",
+    "Critical gap": "#DC2626",
+}
+
+RECOMMENDATION_COLORS = {
+    "BID": "#16A34A",
+    "BID WITH CONDITIONS": "#D97706",
+    "NO-BID": "#DC2626",
+    "NEEDS REVIEW": "#64748B",
+}
 
 
 # ============================================================
@@ -133,6 +160,9 @@ if "embedding_model" not in st.session_state:
 
 if "documents_ready" not in st.session_state:
     st.session_state.documents_ready = False
+
+if "report" not in st.session_state:
+    st.session_state.report = None
 
 
 # ============================================================
@@ -502,13 +532,66 @@ def check_citation_grounding(
     return (len(unverified) == 0), unverified
 
 
+def _call_groq(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 2500,
+    json_mode: bool = False,
+) -> Tuple[str, object]:
+    """Shared Groq call with retry/backoff on transient errors. Returns
+    (content, usage). Raises RuntimeError if every attempt fails."""
+
+    client = get_groq_client()
+
+    kwargs = {}
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                temperature=0.1,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+
+            return (
+                response.choices[0].message.content,
+                response.usage,
+            )
+
+        except Exception as exc:
+
+            last_error = exc
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+
+    raise RuntimeError(
+        f"Groq request failed after {MAX_RETRIES} attempts: {last_error}"
+    )
+
+
 def analyze_with_groq(
     question: str,
     company_profile: str,
     retrieved_results: List[Dict],
 ) -> Tuple[str, object]:
-
-    client = get_groq_client()
 
     context = format_context(
         retrieved_results
@@ -601,43 +684,295 @@ If you cannot confidently determine suitability from the available
 evidence, say NEEDS REVIEW rather than guessing.
 """
 
-    last_error = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-
-        try:
-
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    },
-                ],
-                temperature=0.1,
-                max_tokens=2500,
-            )
-
-            return (
-                response.choices[0].message.content,
-                response.usage,
-            )
-
-        except Exception as exc:
-
-            last_error = exc
-
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-
-    raise RuntimeError(
-        f"Groq request failed after {MAX_RETRIES} attempts: {last_error}"
+    return _call_groq(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=2500,
     )
+
+
+# ============================================================
+# BID READINESS REPORT
+# ============================================================
+
+def gather_report_evidence(
+    chunks: List[Dict],
+    index,
+    embedding_model,
+) -> List[Dict]:
+    """Retrieve tender evidence for each fixed rubric category and
+    merge into one deduplicated evidence set for the report prompt."""
+
+    seen_chunk_ids = set()
+    evidence = []
+
+    for category in REPORT_CATEGORIES:
+
+        results = retrieve(
+            query=f"{category} requirements for this tender",
+            index=index,
+            chunks=chunks,
+            embedding_model=embedding_model,
+            top_k=REPORT_EVIDENCE_PER_CATEGORY,
+        )
+
+        for result in results:
+
+            if result["document_type"] != "Tender":
+                continue
+
+            if result["chunk_id"] in seen_chunk_ids:
+                continue
+
+            seen_chunk_ids.add(result["chunk_id"])
+            evidence.append(result)
+
+    return evidence[:REPORT_EVIDENCE_MAX_TOTAL]
+
+
+def parse_json_response(text: str) -> Optional[Dict]:
+    """Best-effort parse of a model JSON response, tolerating stray
+    markdown code fences or leading/trailing prose around the object."""
+
+    cleaned = text.strip()
+
+    cleaned = re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        cleaned,
+        flags=re.MULTILINE,
+    )
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+
+    if not match:
+        return None
+
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def generate_bid_readiness_report(
+    company_profile: str,
+    evidence_chunks: List[Dict],
+) -> Tuple[Optional[Dict], str, object]:
+    """Ask the LLM to reason about categories/matrix/risks/recommendation
+    as JSON. Returns (parsed_dict_or_None, raw_text, usage)."""
+
+    context = format_context(evidence_chunks)
+
+    category_list = ", ".join(REPORT_CATEGORIES)
+
+    system_prompt = f"""
+You are BidReady AI, an expert tender-readiness analyst.
+
+You MUST respond with a single valid JSON object and nothing else —
+no markdown fences, no commentary before or after it.
+
+You MUST follow these rules:
+
+1. Use the retrieved evidence as your primary source.
+2. Do not invent tender requirements.
+3. Do not invent company capabilities.
+4. Cite evidence using the exact document name and page number shown
+   in the evidence blocks. Never fabricate a page number.
+5. Score each category from 0-100 based on how well the company
+   profile satisfies the requirements found in that category's
+   evidence. If no evidence was retrieved for a category, score it
+   conservatively and say so in the summary.
+6. Be conservative: a high count of matched requirements does not
+   justify BID if a mandatory requirement is missing.
+7. Use status "Critical gap" for any category with a missing
+   mandatory requirement, "Needs attention" for partial gaps, and
+   "On track" otherwise.
+
+Required JSON shape (exact keys):
+
+{{
+  "categories": [
+    {{"name": "<one of: {category_list}>", "score": <0-100 int>,
+      "status": "On track|Needs attention|Critical gap",
+      "summary": "<one sentence>"}}
+    ... one entry for EACH of these categories, in this order: {category_list}
+  ],
+  "compliance_matrix": [
+    {{"requirement": "<short requirement text>",
+      "category": "<one of: {category_list}>",
+      "status": "Met|Partial|Gap|Needs Review",
+      "evidence_document": "<document name or empty string>",
+      "evidence_page": <page number int, or null>,
+      "note": "<short note>"}}
+    ... one row per distinct requirement found in the evidence
+  ],
+  "risks": {{
+    "critical": ["<critical gap description>", ...],
+    "warnings": ["<warning description>", ...],
+    "strengths": ["<strength description>", ...]
+  }},
+  "recommendation": "BID|BID WITH CONDITIONS|NO-BID|NEEDS REVIEW",
+  "recommendation_reasoning": "<2-3 sentences>",
+  "action_plan": ["<concrete next step>", ...]
+}}
+"""
+
+    user_prompt = f"""
+COMPANY PROFILE
+================
+
+{company_profile}
+
+
+RETRIEVED TENDER EVIDENCE
+=====================================
+
+{context}
+
+
+TASK
+================
+
+Produce the Bid Readiness Report JSON described in the system prompt,
+covering every category, using only the evidence above.
+"""
+
+    raw_text, usage = _call_groq(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=4000,
+        json_mode=True,
+    )
+
+    return parse_json_response(raw_text), raw_text, usage
+
+
+def apply_score_rules(report: Dict) -> Dict:
+    """Deterministic scoring/validation layer, kept separate from the
+    LLM's reasoning per BidReady's code-vs-LLM split: the LLM proposes
+    category scores and a recommendation, code computes the aggregate
+    score and enforces a conservative override rule."""
+
+    categories = report.get("categories") or []
+
+    scores = [
+        category.get("score", 0)
+        for category in categories
+        if isinstance(category.get("score"), (int, float))
+    ]
+
+    overall_score = round(sum(scores) / len(scores)) if scores else 0
+
+    recommendation = report.get(
+        "recommendation", "NEEDS REVIEW"
+    )
+
+    risks = report.get("risks") or {}
+    critical_risks = risks.get("critical") or []
+
+    override_note = None
+
+    if recommendation == "BID" and critical_risks:
+        recommendation = "BID WITH CONDITIONS"
+        override_note = (
+            "BidReady's rule engine downgraded this from BID to BID "
+            "WITH CONDITIONS because one or more critical gaps were "
+            "identified — resolve those before submitting."
+        )
+
+    report["overall_score"] = overall_score
+    report["final_recommendation"] = recommendation
+    report["override_note"] = override_note
+
+    return report
+
+
+def report_to_markdown(report: Dict) -> str:
+    """Render the report dict as a portable markdown summary judges
+    (or the SME) can download and keep."""
+
+    lines = [
+        "# BidReady AI — Bid Readiness Report",
+        "",
+        f"**Overall Score:** {report.get('overall_score', 0)}%  ",
+        f"**Recommendation:** {report.get('final_recommendation', 'NEEDS REVIEW')}",
+        "",
+    ]
+
+    if report.get("override_note"):
+        lines.append(f"> ⚠️ {report['override_note']}")
+        lines.append("")
+
+    lines.append(f"_{report.get('recommendation_reasoning', '')}_")
+    lines.append("")
+
+    lines.append("## Category Scores")
+    lines.append("")
+    lines.append("| Category | Score | Status | Summary |")
+    lines.append("|---|---|---|---|")
+
+    for category in report.get("categories") or []:
+        lines.append(
+            f"| {category.get('name', '')} "
+            f"| {category.get('score', '')}% "
+            f"| {category.get('status', '')} "
+            f"| {category.get('summary', '')} |"
+        )
+
+    lines.append("")
+    lines.append("## Compliance Matrix")
+    lines.append("")
+    lines.append("| Requirement | Category | Status | Evidence | Note |")
+    lines.append("|---|---|---|---|---|")
+
+    for row in report.get("compliance_matrix") or []:
+        evidence = row.get("evidence_document", "")
+        page = row.get("evidence_page")
+        evidence_str = f"{evidence} p.{page}" if evidence and page else evidence
+        lines.append(
+            f"| {row.get('requirement', '')} "
+            f"| {row.get('category', '')} "
+            f"| {row.get('status', '')} "
+            f"| {evidence_str} "
+            f"| {row.get('note', '')} |"
+        )
+
+    risks = report.get("risks") or {}
+
+    def bullet_section(title: str, items: List[str]) -> None:
+        lines.append("")
+        lines.append(f"### {title}")
+        if items:
+            lines.extend(f"- {item}" for item in items)
+        else:
+            lines.append("- None")
+
+    lines.append("")
+    lines.append("## Risk Report")
+    bullet_section("Critical Gaps", risks.get("critical") or [])
+    bullet_section("Warnings", risks.get("warnings") or [])
+    bullet_section("Strengths", risks.get("strengths") or [])
+
+    lines.append("")
+    lines.append("## Action Plan")
+    lines.append("")
+
+    for number, step in enumerate(report.get("action_plan") or [], start=1):
+        lines.append(f"{number}. {step}")
+
+    lines.append("")
+    lines.append(
+        "_BidReady AI is an AI-assisted decision-support tool. Always "
+        "verify requirements against the original tender documentation "
+        "before making a final bid decision._"
+    )
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -846,9 +1181,10 @@ if tender_file and company_file:
                 )
                 st.session_state.documents_ready = True
 
-                # Clear previous conversation when
+                # Clear previous conversation/report when
                 # new documents are uploaded.
                 st.session_state.messages = []
+                st.session_state.report = None
 
                 status.update(
                     label=f"Knowledge base ready — {len(chunks)} chunks indexed.",
@@ -923,6 +1259,215 @@ if st.session_state.documents_ready:
 
 
 # ============================================================
+# BID READINESS REPORT
+# ============================================================
+
+if st.session_state.documents_ready:
+
+    st.divider()
+
+    st.header("📊 2. Bid Readiness Report")
+
+    st.caption(
+        "Generates a scored breakdown across "
+        f"{', '.join(REPORT_CATEGORIES)}, a compliance matrix, "
+        "a risk report, and an action plan."
+    )
+
+    if st.button(
+        "🧮 Generate Bid Readiness Report",
+        use_container_width=True,
+    ):
+
+        company_chunks = [
+            chunk
+            for chunk in st.session_state.chunks
+            if chunk["document_type"] == "Company Profile"
+        ]
+
+        company_profile = "\n\n".join(
+            chunk["text"] for chunk in company_chunks
+        )
+
+        if not company_profile.strip():
+
+            st.warning(
+                "No company profile text is indexed — re-upload a "
+                "text-based company profile PDF and rebuild the "
+                "knowledge base before generating a report."
+            )
+
+        else:
+
+            with st.spinner(
+                "Scoring categories, building the compliance matrix, "
+                "and assessing risk..."
+            ):
+
+                try:
+
+                    evidence = gather_report_evidence(
+                        chunks=st.session_state.chunks,
+                        index=st.session_state.index,
+                        embedding_model=st.session_state.embedding_model,
+                    )
+
+                    parsed, raw_text, usage = generate_bid_readiness_report(
+                        company_profile=company_profile,
+                        evidence_chunks=evidence,
+                    )
+
+                    if parsed is None:
+
+                        st.error(
+                            "The report could not be parsed as JSON. "
+                            "Try generating it again."
+                        )
+
+                        with st.expander("Raw model output"):
+                            st.text(raw_text)
+
+                    else:
+
+                        report = apply_score_rules(parsed)
+                        st.session_state.report = report
+                        st.session_state.report_usage = usage
+
+                except Exception as exc:
+
+                    st.error(f"Report generation failed: {exc}")
+
+    report = st.session_state.report
+
+    if report:
+
+        overall_score = report.get("overall_score", 0)
+        recommendation = report.get(
+            "final_recommendation", "NEEDS REVIEW"
+        )
+        decision_color = RECOMMENDATION_COLORS.get(
+            recommendation, "#64748B"
+        )
+
+        st.markdown(
+            f"""
+            <div class="decision-card" style="background: {decision_color}1A;
+                 border: 1px solid {decision_color};">
+                <div class="score" style="color: {decision_color};">
+                    {overall_score}%
+                </div>
+                <div class="decision" style="color: {decision_color};">
+                    {recommendation}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if report.get("override_note"):
+            st.warning(report["override_note"])
+
+        if report.get("recommendation_reasoning"):
+            st.write(report["recommendation_reasoning"])
+
+        st.subheader("Category Scores")
+
+        st.dataframe(
+            [
+                {
+                    "Category": category.get("name", ""),
+                    "Score": f"{category.get('score', 0)}%",
+                    "Status": category.get("status", ""),
+                    "Summary": category.get("summary", ""),
+                }
+                for category in report.get("categories") or []
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Compliance Matrix")
+
+        status_icons = {
+            "Met": "✅",
+            "Partial": "🟡",
+            "Gap": "❌",
+            "Needs Review": "❓",
+        }
+
+        st.dataframe(
+            [
+                {
+                    "Requirement": row.get("requirement", ""),
+                    "Category": row.get("category", ""),
+                    "Status": (
+                        f"{status_icons.get(row.get('status', ''), '')} "
+                        f"{row.get('status', '')}"
+                    ),
+                    "Evidence": (
+                        f"{row.get('evidence_document', '')} "
+                        f"p.{row.get('evidence_page')}"
+                        if row.get("evidence_document")
+                        and row.get("evidence_page")
+                        else row.get("evidence_document", "")
+                    ),
+                    "Note": row.get("note", ""),
+                }
+                for row in report.get("compliance_matrix") or []
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Risk Report")
+
+        risks = report.get("risks") or {}
+
+        risk_col1, risk_col2, risk_col3 = st.columns(3)
+
+        with risk_col1:
+            st.markdown("**🔴 Critical Gaps**")
+            for item in risks.get("critical") or []:
+                st.write(f"- {item}")
+
+        with risk_col2:
+            st.markdown("**🟡 Warnings**")
+            for item in risks.get("warnings") or []:
+                st.write(f"- {item}")
+
+        with risk_col3:
+            st.markdown("**🟢 Strengths**")
+            for item in risks.get("strengths") or []:
+                st.write(f"- {item}")
+
+        st.subheader("Action Plan")
+
+        for number, step in enumerate(
+            report.get("action_plan") or [], start=1
+        ):
+            st.write(f"{number}. {step}")
+
+        report_usage = st.session_state.get("report_usage")
+
+        if report_usage:
+            st.caption(
+                f"Report generation used "
+                f"{getattr(report_usage, 'prompt_tokens', 0)} prompt + "
+                f"{getattr(report_usage, 'completion_tokens', 0)} "
+                f"completion tokens "
+                f"(~${estimate_cost(report_usage):.5f} estimated)."
+            )
+
+        st.download_button(
+            "⬇️ Download Report (Markdown)",
+            data=report_to_markdown(report),
+            file_name="bidready_report.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+
+# ============================================================
 # CHAT / QUESTIONS
 # ============================================================
 
@@ -930,7 +1475,7 @@ if st.session_state.documents_ready:
 
     st.divider()
 
-    st.header("💬 2. Ask BidReady AI")
+    st.header("💬 3. Ask BidReady AI")
 
     st.caption(
         "Ask whether the tender is suitable, what requirements "
