@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from typing import List, Dict, Tuple
 
 import numpy as np
@@ -22,6 +23,16 @@ except ImportError:
 APP_NAME = "BidReady AI"
 
 GROQ_MODEL = "openai/gpt-oss-20b"
+
+# Estimated Groq pricing for GROQ_MODEL, USD per 1M tokens.
+# These are placeholders for the cost-per-query display below —
+# update to match current published Groq pricing before quoting them.
+GROQ_INPUT_COST_PER_M = 0.10
+GROQ_OUTPUT_COST_PER_M = 0.50
+
+# Transient-error retry settings for Groq calls (rate limits, network blips).
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 2
 
 # Lightweight and strong general-purpose embedding model.
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -449,11 +460,53 @@ Content:
 # GROQ ANALYSIS
 # ============================================================
 
+def estimate_cost(usage) -> float:
+    """Rough USD cost estimate from a Groq usage object, using the
+    placeholder per-token pricing in GROQ_INPUT_COST_PER_M / _OUTPUT_."""
+
+    if usage is None:
+        return 0.0
+
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+
+    return (
+        prompt_tokens / 1_000_000 * GROQ_INPUT_COST_PER_M
+        + completion_tokens / 1_000_000 * GROQ_OUTPUT_COST_PER_M
+    )
+
+
+def check_citation_grounding(
+    answer: str,
+    retrieved_results: List[Dict],
+) -> Tuple[bool, List[int]]:
+    """Best-effort check that every 'Page N' the model cites in its
+    answer was actually present in the retrieved evidence. Flags likely
+    fabricated citations; it cannot catch every phrasing, so absence of
+    a warning is not a guarantee, only a lack of detected mismatch."""
+
+    cited_pages = {
+        int(match)
+        for match in re.findall(r"[Pp]age\s+(\d+)", answer)
+    }
+
+    if not cited_pages:
+        return True, []
+
+    retrieved_pages = {
+        result["page"] for result in retrieved_results
+    }
+
+    unverified = sorted(cited_pages - retrieved_pages)
+
+    return (len(unverified) == 0), unverified
+
+
 def analyze_with_groq(
     question: str,
     company_profile: str,
     retrieved_results: List[Dict],
-) -> str:
+) -> Tuple[str, object]:
 
     client = get_groq_client()
 
@@ -548,23 +601,43 @@ If you cannot confidently determine suitability from the available
 evidence, say NEEDS REVIEW rather than guessing.
 """
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_prompt,
-            },
-        ],
-        temperature=0.1,
-        max_tokens=2500,
-    )
+    last_error = None
 
-    return response.choices[0].message.content
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                temperature=0.1,
+                max_tokens=2500,
+            )
+
+            return (
+                response.choices[0].message.content,
+                response.usage,
+            )
+
+        except Exception as exc:
+
+            last_error = exc
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+
+    raise RuntimeError(
+        f"Groq request failed after {MAX_RETRIES} attempts: {last_error}"
+    )
 
 
 # ============================================================
@@ -574,38 +647,50 @@ evidence, say NEEDS REVIEW rather than guessing.
 def process_documents(
     tender_file,
     company_file,
+    status=None,
 ):
 
-    all_pages = []
+    if status:
+        status.update(label="Extracting text from PDFs...")
 
     tender_pages = extract_pdf_pages(
         tender_file,
         "Tender",
     )
 
+    if not tender_pages:
+        raise ValueError(
+            f"No extractable text was found in '{tender_file.name}'. "
+            "It may be a scanned/image-only PDF — try a text-based PDF."
+        )
+
     company_pages = extract_pdf_pages(
         company_file,
         "Company Profile",
     )
 
-    all_pages.extend(
-        tender_pages
-    )
-
-    all_pages.extend(
-        company_pages
-    )
-
-    if not all_pages:
+    if not company_pages:
         raise ValueError(
-            "No readable text was found in the uploaded PDFs."
+            f"No extractable text was found in '{company_file.name}'. "
+            "It may be a scanned/image-only PDF — try a text-based PDF."
         )
+
+    all_pages = tender_pages + company_pages
+
+    if status:
+        status.update(label="Cleaning and chunking document text...")
 
     chunks = create_chunks(
         all_pages
     )
 
+    if status:
+        status.update(label="Loading embedding model...")
+
     embedding_model = load_embedding_model()
+
+    if status:
+        status.update(label="Generating embeddings and building FAISS index...")
 
     index = build_faiss_index(
         chunks,
@@ -740,16 +825,17 @@ if tender_file and company_file:
         use_container_width=True,
     ):
 
-        with st.spinner(
-            "Extracting PDFs, creating chunks, "
-            "generating embeddings, and building FAISS index..."
-        ):
+        with st.status(
+            "Building knowledge base...",
+            expanded=True,
+        ) as status:
 
             try:
 
                 pages, chunks, index = process_documents(
                     tender_file,
                     company_file,
+                    status=status,
                 )
 
                 st.session_state.documents = pages
@@ -764,12 +850,17 @@ if tender_file and company_file:
                 # new documents are uploaded.
                 st.session_state.messages = []
 
-                st.success(
-                    f"Knowledge base created successfully. "
-                    f"{len(chunks)} chunks indexed."
+                status.update(
+                    label=f"Knowledge base ready — {len(chunks)} chunks indexed.",
+                    state="complete",
                 )
 
             except Exception as exc:
+
+                status.update(
+                    label="Knowledge base build failed.",
+                    state="error",
+                )
 
                 st.error(
                     f"Could not build knowledge base: {exc}"
@@ -911,7 +1002,16 @@ if st.session_state.documents_ready:
                     for chunk in company_chunks
                 )
 
-                answer = analyze_with_groq(
+                if not company_profile.strip():
+                    st.warning(
+                        "No company profile text is indexed, so an "
+                        "answer would not be grounded in your company's "
+                        "actual capabilities. Re-upload a text-based "
+                        "company profile PDF and rebuild the knowledge base."
+                    )
+                    st.stop()
+
+                answer, usage = analyze_with_groq(
                     question=question,
                     company_profile=company_profile,
                     retrieved_results=results,
@@ -927,6 +1027,43 @@ if st.session_state.documents_ready:
                 st.chat_message(
                     "assistant"
                 ).markdown(answer)
+
+                is_grounded, unverified_pages = check_citation_grounding(
+                    answer,
+                    results,
+                )
+
+                if not is_grounded:
+                    st.warning(
+                        "⚠️ This answer cites page(s) "
+                        f"{', '.join(str(p) for p in unverified_pages)} "
+                        "that weren't in the retrieved evidence for this "
+                        "question — treat that citation as unverified and "
+                        "check the source document directly."
+                    )
+
+                cost = estimate_cost(usage)
+
+                cost_col1, cost_col2, cost_col3 = st.columns(3)
+
+                cost_col1.metric(
+                    "Prompt tokens",
+                    getattr(usage, "prompt_tokens", 0),
+                )
+                cost_col2.metric(
+                    "Completion tokens",
+                    getattr(usage, "completion_tokens", 0),
+                )
+                cost_col3.metric(
+                    "Est. cost (query)",
+                    f"${cost:.5f}",
+                )
+
+                st.caption(
+                    "Cost is a rough estimate based on placeholder "
+                    "per-token pricing — see GROQ_INPUT_COST_PER_M / "
+                    "GROQ_OUTPUT_COST_PER_M in app.py."
+                )
 
                 # ----------------------------------------
                 # RETRIEVED EVIDENCE
