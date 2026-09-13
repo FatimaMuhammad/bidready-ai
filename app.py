@@ -1,13 +1,18 @@
 import os
 import re
-from typing import Dict, List
+from typing import List, Dict, Tuple
 
-import faiss
-import fitz
 import numpy as np
 import streamlit as st
-from groq import Groq
+import fitz  # PyMuPDF
+
 from sentence_transformers import SentenceTransformer
+from groq import Groq
+
+try:
+    import faiss
+except ImportError:
+    faiss = None
 
 
 # ============================================================
@@ -18,12 +23,10 @@ APP_NAME = "BidReady AI"
 
 GROQ_MODEL = "openai/gpt-oss-20b"
 
+# Lightweight and strong general-purpose embedding model.
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-TOP_K_TENDER = 5
-TOP_K_COMPANY = 5
-
-SIMILARITY_THRESHOLD = 0.25
+TOP_K = 6
 
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
@@ -34,7 +37,7 @@ CHUNK_OVERLAP = 150
 # ============================================================
 
 st.set_page_config(
-    page_title=APP_NAME,
+    page_title="BidReady AI",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -66,8 +69,7 @@ st.markdown(
         padding: 25px;
         border-radius: 18px;
         text-align: center;
-        margin: 15px 0 25px 0;
-        border: 1px solid #E2E8F0;
+        margin: 10px 0 25px 0;
     }
 
     .score {
@@ -88,26 +90,9 @@ st.markdown(
         margin-bottom: 12px;
     }
 
-    .source-label {
-        color: #475569;
+    .small-label {
+        color: #64748B;
         font-size: 0.85rem;
-        font-weight: 600;
-    }
-
-    .warning-card {
-        padding: 15px;
-        border-radius: 10px;
-        background: #FFF7ED;
-        border-left: 5px solid #EA580C;
-        margin: 10px 0;
-    }
-
-    .success-card {
-        padding: 15px;
-        border-radius: 10px;
-        background: #F0FDF4;
-        border-left: 5px solid #16A34A;
-        margin: 10px 0;
     }
 
     </style>
@@ -120,27 +105,27 @@ st.markdown(
 # SESSION STATE
 # ============================================================
 
-DEFAULT_STATE = {
-    "messages": [],
-    "tender_pages": [],
-    "company_pages": [],
-    "tender_chunks": [],
-    "company_chunks": [],
-    "tender_index": None,
-    "company_index": None,
-    "embedding_model": None,
-    "documents_ready": False,
-    "tender_name": "",
-    "company_name": "",
-}
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-for key, value in DEFAULT_STATE.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+if "documents" not in st.session_state:
+    st.session_state.documents = []
+
+if "index" not in st.session_state:
+    st.session_state.index = None
+
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+
+if "embedding_model" not in st.session_state:
+    st.session_state.embedding_model = None
+
+if "documents_ready" not in st.session_state:
+    st.session_state.documents_ready = False
 
 
 # ============================================================
-# LOAD EMBEDDING MODEL
+# LOAD MODELS
 # ============================================================
 
 @st.cache_resource(show_spinner="Loading embedding model...")
@@ -148,38 +133,36 @@ def load_embedding_model():
     return SentenceTransformer(EMBEDDING_MODEL)
 
 
-# ============================================================
-# GROQ CLIENT
-# ============================================================
+def get_groq_client():
+    """
+    Get Groq API client from Streamlit secrets.
 
-def get_groq_client() -> Groq:
+    Streamlit Cloud:
+        GROQ_API_KEY = "..."
+
+    Local environment:
+        GROQ_API_KEY environment variable
+    """
+
     api_key = None
 
+    # Streamlit secrets
     try:
         api_key = st.secrets.get("GROQ_API_KEY")
     except Exception:
         pass
 
+    # Environment variable fallback
     if not api_key:
         api_key = os.getenv("GROQ_API_KEY")
 
     if not api_key:
-        raise RuntimeError(
-            "GROQ_API_KEY is not configured. "
-            "Add GROQ_API_KEY to Streamlit Secrets."
+        raise ValueError(
+            "GROQ_API_KEY was not found. "
+            "Add it to Streamlit Secrets."
         )
 
     return Groq(api_key=api_key)
-
-
-# ============================================================
-# TEXT CLEANING
-# ============================================================
-
-def clean_text(text: str) -> str:
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
 
 
 # ============================================================
@@ -193,11 +176,6 @@ def extract_pdf_pages(
 
     pdf_bytes = uploaded_file.getvalue()
 
-    if not pdf_bytes:
-        raise ValueError(
-            f"{uploaded_file.name} is empty."
-        )
-
     try:
         document = fitz.open(
             stream=pdf_bytes,
@@ -206,33 +184,53 @@ def extract_pdf_pages(
     except Exception as exc:
         raise ValueError(
             f"Could not open {uploaded_file.name}: {exc}"
-        ) from exc
+        )
 
     pages = []
 
-    try:
-        for page_number, page in enumerate(
-            document,
-            start=1,
-        ):
-            text = page.get_text("text")
-            text = clean_text(text)
+    for page_number, page in enumerate(
+        document,
+        start=1,
+    ):
 
-            if not text:
-                continue
+        text = page.get_text("text").strip()
 
-            pages.append(
-                {
-                    "document": uploaded_file.name,
-                    "document_type": document_type,
-                    "page": page_number,
-                    "text": text,
-                }
-            )
-    finally:
-        document.close()
+        if not text:
+            continue
+
+        pages.append(
+            {
+                "document": uploaded_file.name,
+                "document_type": document_type,
+                "page": page_number,
+                "text": text,
+            }
+        )
+
+    document.close()
 
     return pages
+
+
+# ============================================================
+# TEXT CLEANING
+# ============================================================
+
+def clean_text(text: str) -> str:
+
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return text.strip()
 
 
 # ============================================================
@@ -241,11 +239,14 @@ def extract_pdf_pages(
 
 def chunk_page(
     page: Dict,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
 ) -> List[Dict]:
 
-    text = page["text"]
+    text = clean_text(page["text"])
 
-    if len(text) <= CHUNK_SIZE:
+    if len(text) <= chunk_size:
+
         return [
             {
                 **page,
@@ -265,13 +266,14 @@ def chunk_page(
     while start < len(text):
 
         end = min(
-            start + CHUNK_SIZE,
+            start + chunk_size,
             len(text),
         )
 
         chunk_text = text[start:end].strip()
 
         if chunk_text:
+
             chunks.append(
                 {
                     **page,
@@ -288,7 +290,7 @@ def chunk_page(
             break
 
         start = max(
-            end - CHUNK_OVERLAP,
+            end - overlap,
             start + 1,
         )
 
@@ -301,29 +303,25 @@ def create_chunks(
     pages: List[Dict],
 ) -> List[Dict]:
 
-    chunks = []
+    all_chunks = []
 
     for page in pages:
-        chunks.extend(
+
+        all_chunks.extend(
             chunk_page(page)
         )
 
-    return chunks
+    return all_chunks
 
 
 # ============================================================
-# FAISS INDEX
+# BUILD FAISS INDEX
 # ============================================================
 
 def build_faiss_index(
     chunks: List[Dict],
     embedding_model,
 ):
-
-    if not chunks:
-        raise ValueError(
-            "No chunks available to index."
-        )
 
     texts = [
         chunk["text"]
@@ -337,10 +335,12 @@ def build_faiss_index(
         show_progress_bar=False,
     )
 
-    embeddings = np.asarray(
-        embeddings,
-        dtype="float32",
+    embeddings = embeddings.astype(
+        "float32"
     )
+
+    if faiss is None:
+        return embeddings
 
     dimension = embeddings.shape[1]
 
@@ -362,58 +362,49 @@ def retrieve(
     index,
     chunks: List[Dict],
     embedding_model,
-    top_k: int,
+    top_k: int = TOP_K,
 ) -> List[Dict]:
 
-    if (
-        index is None
-        or not chunks
-        or not query.strip()
-    ):
+    if index is None or not chunks:
         return []
 
     query_embedding = embedding_model.encode(
         [query],
         convert_to_numpy=True,
         normalize_embeddings=True,
-        show_progress_bar=False,
     )
 
-    query_embedding = np.asarray(
-        query_embedding,
-        dtype="float32",
+    query_embedding = query_embedding.astype(
+        "float32"
     )
 
-    k = min(
-        top_k,
-        len(chunks),
-    )
+    result_count = min(top_k, len(chunks))
 
-    scores, indices = index.search(
-        query_embedding,
-        k,
-    )
+    if faiss is None:
+        similarities = np.dot(index, query_embedding[0])
+        indices = np.argsort(similarities)[::-1][:result_count]
+        scores = similarities[indices]
+    else:
+        scores, indices = index.search(
+            query_embedding,
+            result_count,
+        )
+
+        scores = scores[0]
+        indices = indices[0]
 
     results = []
 
-    for score, index_number in zip(
-        scores[0],
-        indices[0],
-    ):
+    for score, index_number in zip(scores, indices):
 
         if index_number < 0:
-            continue
-
-        similarity = float(score)
-
-        if similarity < SIMILARITY_THRESHOLD:
             continue
 
         chunk = dict(
             chunks[index_number]
         )
 
-        chunk["similarity"] = similarity
+        chunk["similarity"] = float(score)
 
         results.append(chunk)
 
@@ -421,66 +412,34 @@ def retrieve(
 
 
 # ============================================================
-# FORMAT RAG CONTEXT
+# FORMAT RETRIEVED EVIDENCE
 # ============================================================
 
 def format_context(
-    tender_results: List[Dict],
-    company_results: List[Dict],
+    results: List[Dict],
 ) -> str:
+
+    if not results:
+        return "No relevant evidence was retrieved."
 
     sections = []
 
-    if tender_results:
+    for number, result in enumerate(
+        results,
+        start=1,
+    ):
 
         sections.append(
-            "========== TENDER EVIDENCE =========="
-        )
-
-        for number, result in enumerate(
-            tender_results,
-            start=1,
-        ):
-
-            sections.append(
-                f"""
-[TENDER EVIDENCE {number}]
-Document: {result["document"]}
-Page: {result["page"]}
-Similarity: {result["similarity"]:.3f}
+            f"""
+[EVIDENCE {number}]
+Document: {result['document']}
+Document Type: {result['document_type']}
+Page: {result['page']}
+Similarity: {result['similarity']:.3f}
 
 Content:
-{result["text"]}
+{result['text']}
 """
-            )
-
-    if company_results:
-
-        sections.append(
-            "========== COMPANY EVIDENCE =========="
-        )
-
-        for number, result in enumerate(
-            company_results,
-            start=1,
-        ):
-
-            sections.append(
-                f"""
-[COMPANY EVIDENCE {number}]
-Document: {result["document"]}
-Page: {result["page"]}
-Similarity: {result["similarity"]:.3f}
-
-Content:
-{result["text"]}
-"""
-            )
-
-    if not sections:
-        return (
-            "No sufficiently relevant evidence "
-            "was retrieved."
         )
 
     return "\n".join(sections)
@@ -492,68 +451,38 @@ Content:
 
 def analyze_with_groq(
     question: str,
-    tender_results: List[Dict],
-    company_results: List[Dict],
+    company_profile: str,
+    retrieved_results: List[Dict],
 ) -> str:
 
     client = get_groq_client()
 
     context = format_context(
-        tender_results,
-        company_results,
+        retrieved_results
     )
 
     system_prompt = """
-You are BidReady AI, an evidence-grounded tender
-readiness assistant.
+You are BidReady AI, an expert tender-readiness assistant.
 
-Your purpose is to help a business assess whether
-a tender appears suitable for its company.
+Your job is to help a company determine whether a tender appears
+suitable for them.
 
-IMPORTANT EVIDENCE RULES:
+You MUST follow these rules:
 
-1. Use only the retrieved tender and company evidence.
-2. Do not invent facts.
-3. Do not assume that missing evidence means the company fails.
-4. When evidence is insufficient, say NEEDS REVIEW.
-5. Never fabricate page numbers.
-6. Every important factual claim should identify its source.
-7. Distinguish tender requirements from company capabilities.
-8. Pay special attention to mandatory requirements.
-9. Be conservative with bid recommendations.
-
-For each important requirement, classify it as:
-
-MATCH
-PARTIAL MATCH
-GAP
-NEEDS REVIEW
-
-Possible overall recommendations:
-
-BID
-BID WITH CONDITIONS
-NO-BID
-NEEDS REVIEW
-
-A mandatory requirement that appears to be unmet
-is more important than a large number of minor matches.
-
-Do not provide legal or official procurement advice.
-"""
-
-    user_prompt = f"""
-# USER QUESTION
-
-{question}
-
-# RETRIEVED EVIDENCE
-
-{context}
-
-# TASK
-
-Answer the user's question using the retrieved evidence.
+1. Use the retrieved evidence as your primary source.
+2. Do not invent tender requirements.
+3. Do not invent company capabilities.
+4. If the evidence is insufficient, say NEEDS REVIEW.
+5. Distinguish between:
+   - Match
+   - Partial Match
+   - Gap
+   - Needs Review
+6. Pay special attention to mandatory requirements.
+7. Cite evidence using document name and page number.
+8. Never fabricate a page number.
+9. Be conservative about bid recommendations.
+10. Explain your reasoning clearly.
 
 For suitability questions, consider:
 
@@ -568,43 +497,55 @@ For suitability questions, consider:
 - Deadlines
 - Mandatory conditions
 
-Use this structure when appropriate:
+If a mandatory requirement appears to be missing,
+highlight it prominently.
 
-## Direct Answer
+A high number of matches does NOT automatically mean the tender
+is suitable if an important mandatory requirement is missing.
 
-Give the answer first.
-
-## Suitability Assessment
-
-Explain whether the tender appears suitable.
-
-## Requirements We Match
-
-List important matches.
-
-## Gaps and Risks
-
-List important gaps, partial matches, and risks.
-
-## Evidence
-
-Cite document name and page number.
-
-## Recommendation
-
-Use one of:
+Possible recommendations:
 
 BID
 BID WITH CONDITIONS
 NO-BID
 NEEDS REVIEW
+"""
 
-## Next Steps
+    user_prompt = f"""
+COMPANY PROFILE
+================
 
-Give practical actions.
+{company_profile}
 
-If the evidence is insufficient, do not guess.
-Use NEEDS REVIEW.
+
+USER QUESTION
+================
+
+{question}
+
+
+RETRIEVED TENDER / COMPANY EVIDENCE
+=====================================
+
+{context}
+
+
+TASK
+================
+
+Answer the user's question using the evidence above.
+
+When appropriate, structure your response as:
+
+1. Direct Answer
+2. Readiness Assessment
+3. Matching Requirements
+4. Gaps / Risks
+5. Evidence
+6. Recommended Next Steps
+
+If you cannot confidently determine suitability from the available
+evidence, say NEEDS REVIEW rather than guessing.
 """
 
     response = client.chat.completions.create(
@@ -620,28 +561,22 @@ Use NEEDS REVIEW.
             },
         ],
         temperature=0.1,
-        max_completion_tokens=3000,
-        include_reasoning=False,
+        max_tokens=2500,
     )
 
-    answer = response.choices[0].message.content
-
-    if not answer:
-        raise RuntimeError(
-            "Groq returned an empty response."
-        )
-
-    return answer
+    return response.choices[0].message.content
 
 
 # ============================================================
-# BUILD KNOWLEDGE BASE
+# DOCUMENT INGESTION
 # ============================================================
 
 def process_documents(
     tender_file,
     company_file,
 ):
+
+    all_pages = []
 
     tender_pages = extract_pdf_pages(
         tender_file,
@@ -653,99 +588,35 @@ def process_documents(
         "Company Profile",
     )
 
-    if not tender_pages:
-        raise ValueError(
-            "No readable text was found in the tender PDF. "
-            "Please upload a searchable PDF."
-        )
-
-    if not company_pages:
-        raise ValueError(
-            "No readable text was found in the company profile PDF. "
-            "Please upload a searchable PDF."
-        )
-
-    tender_chunks = create_chunks(
+    all_pages.extend(
         tender_pages
     )
 
-    company_chunks = create_chunks(
+    all_pages.extend(
         company_pages
+    )
+
+    if not all_pages:
+        raise ValueError(
+            "No readable text was found in the uploaded PDFs."
+        )
+
+    chunks = create_chunks(
+        all_pages
     )
 
     embedding_model = load_embedding_model()
 
-    tender_index = build_faiss_index(
-        tender_chunks,
-        embedding_model,
-    )
-
-    company_index = build_faiss_index(
-        company_chunks,
+    index = build_faiss_index(
+        chunks,
         embedding_model,
     )
 
     return (
-        tender_pages,
-        company_pages,
-        tender_chunks,
-        company_chunks,
-        tender_index,
-        company_index,
-        embedding_model,
+        all_pages,
+        chunks,
+        index,
     )
-
-
-# ============================================================
-# DISPLAY EVIDENCE
-# ============================================================
-
-def display_evidence(
-    title: str,
-    results: List[Dict],
-):
-
-    with st.expander(
-        f"{title} ({len(results)} chunks)"
-    ):
-
-        if not results:
-
-            st.warning(
-                "No sufficiently relevant evidence was retrieved."
-            )
-
-            return
-
-        for number, result in enumerate(
-            results,
-            start=1,
-        ):
-
-            st.markdown(
-                f"""
-                <div class="evidence-card">
-
-                <strong>
-                Evidence {number}
-                </strong>
-
-                <br>
-
-                <span class="source-label">
-                {result["document"]}
-                • Page {result["page"]}
-                • Similarity {result["similarity"]:.3f}
-                </span>
-
-                <br><br>
-
-                {result["text"]}
-
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
 
 
 # ============================================================
@@ -760,17 +631,16 @@ st.markdown(
 st.markdown(
     """
     <div class="subtitle">
-    Know Before You Bid — evidence-grounded RAG
-    for tender suitability analysis.
+        Know Before You Bid — RAG-powered tender intelligence
+        for businesses.
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 st.write(
-    "Upload a tender and your company profile. "
-    "BidReady AI retrieves relevant evidence from both "
-    "documents and uses Groq to assess suitability."
+    "Upload your company profile and tender, then ask questions "
+    "about eligibility, requirements, risks, and bid suitability."
 )
 
 
@@ -780,33 +650,19 @@ st.write(
 
 with st.sidebar:
 
-    st.header("⚙️ System")
+    st.header("⚙️ Configuration")
 
-    st.markdown(
-        f"""
-        **LLM**
-
-        `{GROQ_MODEL}`
-
-        **Embeddings**
-
-        `{EMBEDDING_MODEL}`
-
-        **Vector Database**
-
-        FAISS
-
-        **PDF Extraction**
-
-        PyMuPDF
-        """
+    st.info(
+        "This application uses:\n\n"
+        "• PyMuPDF for PDF extraction\n"
+        "• Sentence Transformers for embeddings\n"
+        "• FAISS for vector retrieval\n"
+        "• Groq for LLM reasoning"
     )
 
     st.divider()
 
-    st.subheader(
-        "API Configuration"
-    )
+    st.subheader("Required API Key")
 
     st.code(
         "GROQ_API_KEY",
@@ -814,9 +670,8 @@ with st.sidebar:
     )
 
     st.caption(
-        "Configure the API key through "
-        "Streamlit Secrets. Never commit "
-        "the key to GitHub."
+        "Add your Groq API key through Streamlit "
+        "Cloud Secrets."
     )
 
     st.divider()
@@ -828,23 +683,16 @@ with st.sidebar:
         )
 
         st.metric(
-            "Tender chunks",
+            "Indexed chunks",
             len(
-                st.session_state.tender_chunks
-            ),
-        )
-
-        st.metric(
-            "Company chunks",
-            len(
-                st.session_state.company_chunks
+                st.session_state.chunks
             ),
         )
 
     else:
 
         st.warning(
-            "Upload both PDFs and build the knowledge base."
+            "Upload both PDFs to build the knowledge base."
         )
 
 
@@ -852,9 +700,7 @@ with st.sidebar:
 # DOCUMENT UPLOAD
 # ============================================================
 
-st.header(
-    "📄 1. Upload Documents"
-)
+st.header("📄 1. Upload Documents")
 
 col1, col2 = st.columns(2)
 
@@ -864,7 +710,9 @@ with col1:
         "Tender / RFP PDF",
         type=["pdf"],
         key="tender_pdf",
-        help="Upload the tender you want to evaluate.",
+        help=(
+            "Upload the tender you want to evaluate."
+        ),
     )
 
 with col2:
@@ -874,9 +722,8 @@ with col2:
         type=["pdf"],
         key="company_pdf",
         help=(
-            "Upload your company profile, "
-            "experience, certifications, capabilities, "
-            "financial information, etc."
+            "Upload your company's profile, "
+            "capabilities, experience, certifications, etc."
         ),
     )
 
@@ -887,8 +734,6 @@ with col2:
 
 if tender_file and company_file:
 
-    st.divider()
-
     if st.button(
         "🔎 Build BidReady Knowledge Base",
         type="primary",
@@ -896,67 +741,32 @@ if tender_file and company_file:
     ):
 
         with st.spinner(
-            "Extracting documents, creating chunks, "
-            "generating embeddings, and building FAISS indexes..."
+            "Extracting PDFs, creating chunks, "
+            "generating embeddings, and building FAISS index..."
         ):
 
             try:
 
-                (
-                    tender_pages,
-                    company_pages,
-                    tender_chunks,
-                    company_chunks,
-                    tender_index,
-                    company_index,
-                    embedding_model,
-                ) = process_documents(
+                pages, chunks, index = process_documents(
                     tender_file,
                     company_file,
                 )
 
-                st.session_state.tender_pages = (
-                    tender_pages
-                )
-
-                st.session_state.company_pages = (
-                    company_pages
-                )
-
-                st.session_state.tender_chunks = (
-                    tender_chunks
-                )
-
-                st.session_state.company_chunks = (
-                    company_chunks
-                )
-
-                st.session_state.tender_index = (
-                    tender_index
-                )
-
-                st.session_state.company_index = (
-                    company_index
-                )
-
+                st.session_state.documents = pages
+                st.session_state.chunks = chunks
+                st.session_state.index = index
                 st.session_state.embedding_model = (
-                    embedding_model
+                    load_embedding_model()
                 )
-
                 st.session_state.documents_ready = True
 
+                # Clear previous conversation when
+                # new documents are uploaded.
                 st.session_state.messages = []
 
-                st.session_state.tender_name = (
-                    tender_file.name
-                )
-
-                st.session_state.company_name = (
-                    company_file.name
-                )
-
                 st.success(
-                    "BidReady knowledge base created successfully."
+                    f"Knowledge base created successfully. "
+                    f"{len(chunks)} chunks indexed."
                 )
 
             except Exception as exc:
@@ -967,98 +777,84 @@ if tender_file and company_file:
 
 
 # ============================================================
-# KNOWLEDGE BASE SUMMARY
+# DOCUMENT SUMMARY
 # ============================================================
 
 if st.session_state.documents_ready:
 
-    st.header(
-        "📚 Knowledge Base"
+    st.header("📚 Knowledge Base")
+
+    tender_pages_count = sum(
+        1
+        for item in st.session_state.documents
+        if item["document_type"] == "Tender"
     )
 
-    col1, col2, col3, col4 = st.columns(4)
+    company_pages_count = sum(
+        1
+        for item in st.session_state.documents
+        if item["document_type"] == "Company Profile"
+    )
+
+    col1, col2, col3 = st.columns(3)
 
     col1.metric(
-        "Tender Pages",
-        len(
-            st.session_state.tender_pages
-        ),
+        "Tender pages",
+        tender_pages_count,
     )
 
     col2.metric(
-        "Company Pages",
-        len(
-            st.session_state.company_pages
-        ),
+        "Company profile pages",
+        company_pages_count,
     )
 
     col3.metric(
-        "Tender Chunks",
-        len(
-            st.session_state.tender_chunks
-        ),
-    )
-
-    col4.metric(
-        "Company Chunks",
-        len(
-            st.session_state.company_chunks
-        ),
+        "Indexed chunks",
+        len(st.session_state.chunks),
     )
 
     with st.expander(
-        "🔍 View document information"
+        "🔍 View indexed document information"
     ):
 
-        rows = []
-
-        for item in (
-            st.session_state.tender_pages
-            + st.session_state.company_pages
-        ):
-
-            rows.append(
+        st.dataframe(
+            [
                 {
                     "Document": item["document"],
                     "Type": item["document_type"],
                     "Page": item["page"],
                 }
-            )
-
-        st.dataframe(
-            rows,
+                for item in st.session_state.documents
+            ],
             use_container_width=True,
             hide_index=True,
         )
 
 
 # ============================================================
-# CHAT
+# CHAT / QUESTIONS
 # ============================================================
 
 if st.session_state.documents_ready:
 
     st.divider()
 
-    st.header(
-        "💬 2. Ask BidReady AI"
-    )
+    st.header("💬 2. Ask BidReady AI")
 
     st.caption(
-        "Ask about suitability, requirements, "
-        "gaps, experience, certifications, risks, "
-        "or the recommended bid decision."
+        "Ask whether the tender is suitable, what requirements "
+        "you meet, what gaps exist, or what you should do before bidding."
     )
 
     example_questions = [
         "Is this tender suitable for my company?",
-        "What mandatory requirements do we fail?",
-        "Which requirements do we satisfy?",
+        "What mandatory requirements does my company fail to meet?",
+        "Which tender requirements does my company satisfy?",
+        "What are the biggest risks if we bid?",
         "Do we have enough relevant experience?",
         "What certifications are required?",
         "What documents are missing?",
-        "What are the biggest risks if we bid?",
-        "Should we BID, BID WITH CONDITIONS, NO-BID, or NEEDS REVIEW?",
+        "Should we BID, BID WITH CONDITIONS, or NO-BID?",
     ]
 
     selected_question = st.selectbox(
@@ -1068,26 +864,24 @@ if st.session_state.documents_ready:
     )
 
     question = st.chat_input(
-        "Ask BidReady AI..."
+        "Ask BidReady AI a question..."
     )
 
     if (
         not question
         and selected_question != "Choose a question..."
     ):
-
         question = selected_question
 
     if question:
 
+        # Display user question
         st.chat_message(
             "user"
-        ).write(
-            question
-        )
+        ).write(question)
 
         with st.spinner(
-            "Retrieving tender and company evidence..."
+            "Retrieving evidence and analyzing suitability..."
         ):
 
             try:
@@ -1096,26 +890,31 @@ if st.session_state.documents_ready:
                     st.session_state.embedding_model
                 )
 
-                tender_results = retrieve(
+                results = retrieve(
                     query=question,
-                    index=st.session_state.tender_index,
-                    chunks=st.session_state.tender_chunks,
+                    index=st.session_state.index,
+                    chunks=st.session_state.chunks,
                     embedding_model=embedding_model,
-                    top_k=TOP_K_TENDER,
+                    top_k=TOP_K,
                 )
 
-                company_results = retrieve(
-                    query=question,
-                    index=st.session_state.company_index,
-                    chunks=st.session_state.company_chunks,
-                    embedding_model=embedding_model,
-                    top_k=TOP_K_COMPANY,
+                # Build company profile from all company chunks
+                company_chunks = [
+                    chunk
+                    for chunk in st.session_state.chunks
+                    if chunk["document_type"]
+                    == "Company Profile"
+                ]
+
+                company_profile = "\n\n".join(
+                    chunk["text"]
+                    for chunk in company_chunks
                 )
 
                 answer = analyze_with_groq(
                     question=question,
-                    tender_results=tender_results,
-                    company_results=company_results,
+                    company_profile=company_profile,
+                    retrieved_results=results,
                 )
 
                 st.session_state.messages.append(
@@ -1127,19 +926,45 @@ if st.session_state.documents_ready:
 
                 st.chat_message(
                     "assistant"
-                ).markdown(
-                    answer
-                )
+                ).markdown(answer)
 
-                display_evidence(
-                    "🔎 Retrieved Tender Evidence",
-                    tender_results,
-                )
+                # ----------------------------------------
+                # RETRIEVED EVIDENCE
+                # ----------------------------------------
 
-                display_evidence(
-                    "🏢 Retrieved Company Evidence",
-                    company_results,
-                )
+                with st.expander(
+                    f"🔎 Retrieved Evidence ({len(results)} chunks)"
+                ):
+
+                    for number, result in enumerate(
+                        results,
+                        start=1,
+                    ):
+
+                        st.markdown(
+                            f"""
+                            <div class="evidence-card">
+
+                            <strong>
+                            Evidence {number}
+                            </strong>
+
+                            <br>
+
+                            <span class="small-label">
+                            {result['document']}
+                            • Page {result['page']}
+                            • Similarity {result['similarity']:.3f}
+                            </span>
+
+                            <br><br>
+
+                            {result['text']}
+
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
 
             except Exception as exc:
 
@@ -1162,7 +987,7 @@ else:
 st.divider()
 
 st.caption(
-    "BidReady AI is an AI-assisted decision-support system. "
+    "BidReady AI is an AI-assisted decision-support tool. "
     "Always verify important requirements against the original "
     "tender documentation before making a final bid decision."
 )
