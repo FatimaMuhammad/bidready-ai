@@ -2,29 +2,39 @@
 
 ### **Know Before You Bid.**
 
-BidReady AI is an AI-powered **Retrieval-Augmented Generation (RAG)** application designed to help businesses evaluate tender opportunities against their company capabilities.
+BidReady AI is an AI-powered **Retrieval-Augmented Generation (RAG)** application that helps businesses evaluate tender opportunities against their own company capabilities.
 
-The application allows users to upload a **tender/RFP PDF** and a **company profile PDF**, then ask questions about eligibility, requirements, experience, certifications, risks, compliance gaps, and overall bid suitability.
+Upload a **tender/RFP** and a **company profile**, and BidReady AI gives you two ways to use them:
 
-Instead of asking an LLM to analyze an entire document blindly, BidReady AI uses **semantic retrieval with FAISS and Sentence Transformers** to identify relevant evidence before sending it to the language model.
+1. **Bid Readiness Report** — a one-click, scored breakdown of the tender: a Bid Readiness Score, a category-by-category scorecard, a compliance matrix with page-level citations, a colour-coded risk report, a Bid / Bid-with-conditions / No-bid / Needs-review recommendation, and a concrete action plan — downloadable as PDF or Markdown.
+2. **Ask BidReady AI** — a chat interface for open-ended questions about eligibility, requirements, risks, and bid suitability, with every answer grounded in cited evidence.
+
+Instead of asking an LLM to analyze an entire document blindly, BidReady AI uses **semantic retrieval with FAISS and Sentence Transformers** to identify relevant evidence before sending it to the language model — and uses deterministic code, not the LLM, to compute the final score and enforce a conservative safety rule on the recommendation.
 
 ---
 
 ## 🚀 Key Features
 
-* 📄 Tender/RFP PDF ingestion
-* 🏢 Company profile PDF ingestion
+* 📄 Tender/RFP ingestion — **PDF, DOCX, or TXT**
+* 🏢 Company profile ingestion — **PDF, DOCX, JSON, or TXT**
 * 🔎 Semantic document retrieval
 * 🧠 Retrieval-Augmented Generation (RAG)
 * ⚡ FAISS vector similarity search
 * 🤖 Groq-powered LLM inference
-* 📊 Bid-readiness assessment
-* ✅ Requirement-to-company matching
-* ⚠️ Risk and gap identification
-* 📋 Compliance analysis
-* 💬 Natural-language questions about the tender
-* 📌 Evidence-based responses
+* 📊 **Bid Readiness Report** — score, compliance matrix, risk report, action plan, in one click
+* 🧮 **Deterministic scoring** — the overall score is computed by code from category scores, not asserted by the LLM
+* 🛡️ **Rule-engine safety net** — automatically downgrades an over-optimistic "BID" recommendation to "BID WITH CONDITIONS" when critical gaps are present
+* ✅ Requirement-to-company matching with page-level evidence citations
+* ⚠️ Risk and gap identification (Critical / Warning / Strength)
+* 📋 Colour-coded compliance analysis
+* 💬 Natural-language chat about the tender, with citation-grounding checks on every answer
+* 📌 Evidence-based, source-traceable responses
 * 🎯 BID / BID WITH CONDITIONS / NO-BID / NEEDS REVIEW recommendations
+* ⬇️ **Export the report as PDF or Markdown**
+* 💰 Per-query token usage and estimated cost, shown inline
+* 🔁 Automatic retry with backoff on transient API errors
+* 🚦 Truncation detection — flags a report if the model's response was cut off before finishing
+* 🎨 Colourful, theme-aware UI (light/dark) with native Streamlit components — no custom CSS
 * 🌐 Streamlit web interface
 
 ---
@@ -35,18 +45,18 @@ BidReady AI follows a document-grounded RAG architecture.
 
 ```text
                  ┌────────────────────┐
-                 │    Tender PDF      │
+                 │   Tender document   │  (PDF / DOCX / TXT)
                  └─────────┬──────────┘
                            │
                  ┌─────────▼──────────┐
-                 │  Company Profile   │
-                 │       PDF          │
+                 │  Company profile    │  (PDF / DOCX / JSON / TXT)
+                 │      document       │
                  └─────────┬──────────┘
                            │
                            ▼
                   ┌─────────────────┐
-                  │    PyMuPDF      │
-                  │ PDF Extraction  │
+                  │ Format-aware     │
+                  │ text extraction  │
                   └────────┬────────┘
                            │
                            ▼
@@ -67,30 +77,30 @@ BidReady AI follows a document-grounded RAG architecture.
                      │ Vector Index│
                      └──────┬─────┘
                             │
-                     User Question
-                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+     "Generate Report" button      User chat question
+              │                           │
+              ▼                           ▼
+   Retrieval across the fixed    Top-K semantic retrieval
+   Bid Readiness Report rubric   for that specific question
+              │                           │
+              └─────────────┬─────────────┘
                             ▼
-                  ┌─────────────────┐
-                  │ Semantic Search │
-                  │ Top-K Retrieval │
-                  └────────┬────────┘
-                           │
-                           ▼
-                  Retrieved Evidence
-                           │
-                           ▼
                ┌────────────────────────┐
                │        Groq LLM        │
                │    openai/gpt-oss-20b  │
                └────────────┬───────────┘
                             │
-                            ▼
-                  ┌─────────────────┐
-                  │ Grounded Answer │
-                  └────────┬────────┘
-                           │
-                           ▼
-                Bid Suitability Insight
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+   Deterministic scoring &        Grounded chat answer
+   rule-engine safety net         + citation check
+              │                           │
+              ▼                           ▼
+   Bid Readiness Report          Bid Suitability Insight
+   (score, matrix, risks,
+    action plan, PDF/MD export)
 ```
 
 ---
@@ -99,25 +109,32 @@ BidReady AI follows a document-grounded RAG architecture.
 
 ## 1. Document Ingestion
 
-The user uploads two PDF documents:
+The user uploads two documents:
 
 ```text
-Tender / RFP
-Company Profile
+Tender / RFP           → PDF, DOCX, or TXT
+Company Profile        → PDF, DOCX, JSON, or TXT
 ```
 
-PyMuPDF extracts the text while retaining document and page information.
+Extraction is dispatched by file extension to a format-specific extractor:
 
-Each extracted section is associated with metadata such as:
+| Format | Extractor | Page metadata |
+| --- | --- | --- |
+| PDF | PyMuPDF | Real page numbers |
+| DOCX | python-docx (paragraphs + table cells) | Single logical page (Word has no reliable page boundaries) |
+| TXT | Plain-text decode | Split on form-feed page breaks if present, else one page |
+| JSON (company profile only) | Flattened to readable `path: value` lines | Single logical page |
+
+Each extracted section carries metadata:
 
 ```text
-document_type
+document_type   (Tender / Company Profile)
 page_number
 chunk_id
 text
 ```
 
-This allows the application to trace retrieved information back to the source document.
+This lets the application trace every retrieved fact — and every compliance-matrix row — back to its source document and page.
 
 ---
 
@@ -128,7 +145,7 @@ Long documents are divided into smaller overlapping chunks.
 Conceptually:
 
 ```text
-PDF
+Document
  ↓
 Pages
  ↓
@@ -137,7 +154,7 @@ Text
 Chunks
 ```
 
-Smaller chunks improve semantic retrieval because the vector search can identify the specific section relevant to the user's question.
+Smaller chunks improve semantic retrieval because the vector search can identify the specific section relevant to a question or requirement.
 
 ---
 
@@ -171,7 +188,17 @@ even when the wording is different.
 
 The generated embeddings are indexed using **FAISS**.
 
-When a user asks a question:
+For the **Bid Readiness Report**, each of the five fixed rubric categories runs its own retrieval query, and results are deduplicated into one evidence set:
+
+```text
+For each rubric category:
+      ↓
+Category-specific FAISS search
+      ↓
+Deduplicated evidence set
+```
+
+For the **chat**, a single retrieval runs against the user's question:
 
 ```text
 User Question
@@ -183,7 +210,7 @@ FAISS Similarity Search
 Relevant Document Chunks
 ```
 
-Only the most relevant retrieved evidence is passed to the LLM.
+Only the most relevant retrieved evidence is ever passed to the LLM.
 
 ---
 
@@ -195,9 +222,40 @@ The retrieved tender and company evidence is provided to the Groq-hosted model:
 openai/gpt-oss-20b
 ```
 
-The model is instructed to base its answer on the retrieved evidence and clearly indicate when sufficient evidence is unavailable.
+The model is instructed to base its answer only on the retrieved evidence, cite the exact document and page for every claim, and say **NEEDS REVIEW** rather than guess when evidence is insufficient.
 
-This reduces the risk of unsupported assumptions and hallucinated requirements.
+On top of that, the application adds its own safety layer:
+
+* **Retry with backoff** on transient API errors, so a rate limit doesn't fail the whole request.
+* **Citation-grounding check** — flags a chat answer if it cites a page that wasn't actually in the retrieved evidence.
+* **Truncation detection** — flags a report if the model's JSON response looks like it was cut off before finishing the risk report or action plan.
+* **Deterministic scoring** — the LLM proposes a score per category; code computes the overall percentage and normalizes/validates the recommendation, rather than trusting the LLM's arithmetic or exact wording.
+
+This reduces the risk of unsupported assumptions, hallucinated requirements, and silently-wrong numbers.
+
+---
+
+# 🧭 Two Ways to Use BidReady AI
+
+## 1. Bid Readiness Report
+
+Click **Generate Bid Readiness Report** to get, in one shot:
+
+* A **Bid Readiness Score** (0–100%), computed deterministically as the average of five fixed category scores
+* A **category scorecard** — a colourful bar chart plus a table with progress bars and colour-coded status badges
+* A **compliance matrix** — every requirement found in the tender, its status (Met / Partial / Gap / Needs Review), and its exact source document and page
+* A **risk report** — Critical gaps, Warnings, and Strengths, each in their own colour-coded card
+* A **recommendation** (BID / BID WITH CONDITIONS / NO-BID / NEEDS REVIEW), automatically downgraded from BID if any critical gap exists
+* An **action plan** — concrete next steps, shown as a checklist
+* **Download as PDF or Markdown** to share with your team
+
+## 2. Ask BidReady AI
+
+Use the chat to ask anything not covered by the fixed report — see [Example Questions](#-example-questions) below. Every answer:
+
+* Is grounded in retrieved evidence, cited by document and page
+* Is checked for citations that don't match the retrieved evidence
+* Shows the prompt/completion token count and an estimated cost for that query
 
 ---
 
@@ -237,20 +295,28 @@ What should we do before submitting the bid?
 
 # 🎯 Bid Suitability Assessment
 
-BidReady AI evaluates the available evidence across areas such as:
+## Fixed report rubric
 
-| Area                 | Assessment                               |
-| -------------------- | ---------------------------------------- |
-| Eligibility          | Required eligibility conditions          |
-| Technical Capability | Required technical capabilities          |
-| Experience           | Relevant project and industry experience |
-| Certifications       | Required certifications                  |
-| Registrations        | Required licenses/registrations          |
-| Financial Capacity   | Financial and turnover requirements      |
-| Documentation        | Required submission documents            |
-| Geography            | Location or geographic requirements      |
-| Deadlines            | Important submission dates               |
-| Mandatory Conditions | Potentially disqualifying requirements   |
+The **Bid Readiness Report** always scores these five categories, so results stay comparable across tenders:
+
+| Category | What it covers |
+| --- | --- |
+| Eligibility | Registration, licensing, years-in-business, legal eligibility |
+| Technical Match | Technical specifications and scope-of-work requirements |
+| Documentation | Required supporting documents and submission forms |
+| Experience | Relevant past-project experience requirements |
+| Certifications | Required certifications and standards (e.g. ISO) |
+
+## Broader chat context
+
+The **chat** can additionally reason about areas not tied to the fixed rubric, such as:
+
+| Area | Assessment |
+| --- | --- |
+| Financial Capacity | Financial and turnover requirements |
+| Geography | Location or geographic requirements |
+| Deadlines | Important submission dates |
+| Mandatory Conditions | Potentially disqualifying requirements |
 
 ---
 
@@ -266,6 +332,8 @@ The available evidence indicates that the company appears capable of satisfying 
 
 The company appears potentially suitable, but one or more important gaps, uncertainties, or risks should be addressed before bidding.
 
+> If the model recommends **BID** while a critical gap is present, BidReady AI's rule engine automatically downgrades it to **BID WITH CONDITIONS** and explains why — the LLM's recommendation is never trusted blindly against its own stated risks.
+
 ### 🔴 NO-BID
 
 The available evidence indicates a significant mandatory or potentially disqualifying requirement that the company does not appear to satisfy.
@@ -280,17 +348,18 @@ The available documents do not provide enough reliable evidence to make a confid
 
 # 🏗️ Technology Stack
 
-| Technology                    | Role                     |
-| ----------------------------- | ------------------------ |
-| **Python**                    | Application logic        |
-| **Streamlit**                 | Web application and UI   |
-| **PyMuPDF**                   | PDF text extraction      |
-| **Sentence Transformers**     | Semantic embeddings      |
-| **FAISS**                     | Vector similarity search |
-| **Groq**                      | LLM inference            |
-| **openai/gpt-oss-20b**        | Language model           |
-| **GitHub**                    | Source-code repository   |
-| **Streamlit Community Cloud** | Application deployment   |
+| Technology                    | Role                                |
+| ------------------------------ | ------------------------------------ |
+| **Python**                    | Application logic                   |
+| **Streamlit**                 | Web application and UI              |
+| **PyMuPDF**                   | PDF text extraction and PDF export  |
+| **python-docx**               | DOCX text extraction                |
+| **Sentence Transformers**     | Semantic embeddings                 |
+| **FAISS**                     | Vector similarity search            |
+| **Groq**                      | LLM inference                       |
+| **openai/gpt-oss-20b**        | Language model                      |
+| **GitHub**                    | Source-code repository              |
+| **Streamlit Community Cloud** | Application deployment              |
 
 ---
 
@@ -301,11 +370,11 @@ bidready-ai/
 │
 ├── app.py
 ├── requirements.txt
-├── README.md
-├── .gitignore
+├── README
+├── gitignore
 │
 └── .streamlit/
-    └── config.toml
+    └── config.toml     # theme (light/dark) + server settings
 ```
 
 > API credentials and private documents should never be committed to the repository.
@@ -324,7 +393,7 @@ Do **not** write:
 GROQ_API_KEY = "your-secret-key"
 ```
 
-Do not commit `.env`, API credentials, private PDFs, or other secrets to GitHub.
+Do not commit `.env`, API credentials, private documents, or other secrets to GitHub.
 
 For Streamlit Community Cloud, the credential should be configured through the application's **Secrets** configuration.
 
@@ -411,12 +480,13 @@ It does **not**:
 * Replace procurement professionals
 * Replace legal or financial advice
 * Automatically submit a tender
-* Guarantee complete extraction from every PDF
+* Extract text from scanned/image-only PDFs (no OCR yet — a text-based file is required)
 * Guarantee that every relevant requirement is retrieved
 * Guarantee that AI-generated reasoning is always correct
+* Track page numbers within DOCX/TXT/JSON sources as precisely as PDF (these are treated as one logical page)
 * Replace verification against the original tender document
 
-For important decisions, users should verify the relevant requirement against the original tender documentation.
+For important decisions, users should verify the relevant requirement against the original tender documentation. The app's own footer and system prompts reinforce this — outputs are framed as decision support, never as a certified compliance determination.
 
 ---
 
@@ -428,48 +498,54 @@ A company uploads:
 
 ```text
 Tender_RFP.pdf
-Company_Profile.pdf
+Company_Profile.docx
 ```
 
-The user asks:
+### Bid Readiness Report
+
+Clicking **Generate Bid Readiness Report** produces something like:
+
+```text
+Bid Readiness Score: 78%
+Recommendation: BID WITH CONDITIONS
+
+Category Scores:
+  Eligibility        92%  On track
+  Technical Match     86%  On track
+  Documentation       63%  Needs attention
+  Experience          78%  On track
+  Certifications      54%  Critical gap
+
+Risk Report:
+  Critical: Missing ISO 9001 certification evidence
+  Warning:  Submission deadline is tight relative to document prep
+  Strength: 7 years of directly relevant project experience
+
+Action Plan:
+  1. Obtain or renew ISO 9001 certification before submission
+  2. Confirm turnover statements match the required financial threshold
+  3. Prepare the missing supporting documentation listed in the matrix
+```
+
+Downloadable as PDF or Markdown.
+
+### Chat
 
 > **Is this tender suitable for my company?**
 
-The RAG pipeline retrieves relevant evidence concerning:
+The chat retrieves relevant evidence concerning the tender's requirements and the company's stated capabilities, then answers with citations, e.g.:
 
 ```text
-Tender:
-- Minimum experience
-- Required certifications
-- Financial capacity
-- Technical requirements
+Recommendation: BID WITH CONDITIONS
 
-Company:
-- Years of experience
-- Certifications
-- Previous projects
-- Financial capacity
-- Technical capabilities
-```
-
-The LLM then compares the retrieved evidence and produces an explanation such as:
-
-```text
-Recommendation:
-BID WITH CONDITIONS
-
-Strengths:
-✓ Required technical capability
-✓ Required years of experience
-✓ Relevant previous projects
+Matching Requirements:
+✓ Required technical capability (tender.pdf, p.4)
+✓ Required years of experience (company.docx)
 
 Gaps:
-⚠ Required certification evidence is incomplete
+⚠ ISO 9001 certification evidence is incomplete (tender.pdf, p.7)
 
-Risk:
-Medium
-
-Suggested Action:
+Suggested Next Step:
 Verify certification documentation before bid submission.
 ```
 
@@ -487,10 +563,10 @@ The LLM should receive relevant document evidence rather than relying solely on 
 
 ### 2. Evidence over assumptions
 
-The system should distinguish between:
+The system distinguishes between:
 
 ```text
-MATCH
+MET
 PARTIAL
 GAP
 NEEDS REVIEW
@@ -498,11 +574,15 @@ NEEDS REVIEW
 
 rather than inventing missing company information.
 
-### 3. Source awareness
+### 3. Code computes, the LLM reasons
 
-Retrieved chunks retain document/page metadata so that important findings can be traced back to the source material.
+Deterministic code — not the LLM — computes the overall score and enforces the safety-net downgrade rule. The LLM's job is to reason about evidence and propose a recommendation; the app's job is to verify the arithmetic and catch an inconsistent recommendation.
 
-### 4. Decision support, not autonomous bidding
+### 4. Source awareness
+
+Retrieved chunks retain document/page metadata so that every finding in the compliance matrix and every chat citation can be traced back to the source material.
+
+### 5. Decision support, not autonomous bidding
 
 BidReady AI assists the user in evaluating an opportunity. The final bidding decision remains with the business.
 
@@ -512,12 +592,10 @@ BidReady AI assists the user in evaluating an opportunity. The final bidding dec
 
 Potential future versions could include:
 
-* Advanced document reranking
-* OCR support for scanned PDFs
+* OCR support for scanned/image-only PDFs
 * Hybrid keyword + semantic retrieval
-* Better citation rendering
-* Requirement classification
-* Automated compliance matrices
+* Configurable/weighted scoring rubric (beyond a simple average)
+* Persisted action-plan tracking across sessions
 * Multi-tender comparison
 * Tender deadline tracking
 * Company document libraries
