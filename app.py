@@ -1,3 +1,4 @@
+import html
 import io
 import json
 import os
@@ -62,17 +63,26 @@ REPORT_CATEGORIES = [
 REPORT_EVIDENCE_PER_CATEGORY = 5
 REPORT_EVIDENCE_MAX_TOTAL = 25
 
-STATUS_COLORS = {
-    "On track": "#16A34A",
-    "Needs attention": "#D97706",
-    "Critical gap": "#DC2626",
+# Maps to st.badge's named colors, so status/recommendation badges pick
+# up the theme's green/orange/red/gray tokens instead of hardcoded hex.
+STATUS_BADGE_COLORS = {
+    "On track": "green",
+    "Needs attention": "orange",
+    "Critical gap": "red",
 }
 
-RECOMMENDATION_COLORS = {
-    "BID": "#16A34A",
-    "BID WITH CONDITIONS": "#D97706",
-    "NO-BID": "#DC2626",
-    "NEEDS REVIEW": "#64748B",
+RECOMMENDATION_BADGE_COLORS = {
+    "BID": "green",
+    "BID WITH CONDITIONS": "orange",
+    "NO-BID": "red",
+    "NEEDS REVIEW": "gray",
+}
+
+RECOMMENDATION_ICONS = {
+    "BID": ":material/check_circle:",
+    "BID WITH CONDITIONS": ":material/warning:",
+    "NO-BID": ":material/cancel:",
+    "NEEDS REVIEW": ":material/help:",
 }
 
 
@@ -82,66 +92,9 @@ RECOMMENDATION_COLORS = {
 
 st.set_page_config(
     page_title="BidReady AI",
-    page_icon="🎯",
+    page_icon=":material/fact_check:",
     layout="wide",
     initial_sidebar_state="expanded",
-)
-
-
-# ============================================================
-# CUSTOM CSS
-# ============================================================
-
-st.markdown(
-    """
-    <style>
-
-    .main-title {
-        font-size: 3rem;
-        font-weight: 800;
-        color: #0F172A;
-        margin-bottom: 0;
-    }
-
-    .subtitle {
-        font-size: 1.15rem;
-        color: #64748B;
-        margin-bottom: 1.5rem;
-    }
-
-    .decision-card {
-        padding: 25px;
-        border-radius: 18px;
-        text-align: center;
-        margin: 10px 0 25px 0;
-    }
-
-    .score {
-        font-size: 3.5rem;
-        font-weight: 800;
-    }
-
-    .decision {
-        font-size: 1.35rem;
-        font-weight: 700;
-    }
-
-    .evidence-card {
-        padding: 15px;
-        border-radius: 12px;
-        background: #F8FAFC;
-        border: 1px solid #E2E8F0;
-        margin-bottom: 12px;
-    }
-
-    .small-label {
-        color: #64748B;
-        font-size: 0.85rem;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True,
 )
 
 
@@ -169,6 +122,9 @@ if "documents_ready" not in st.session_state:
 
 if "report" not in st.session_state:
     st.session_state.report = None
+
+if "report_version" not in st.session_state:
+    st.session_state.report_version = 0
 
 
 # ============================================================
@@ -1013,7 +969,10 @@ You MUST follow these rules:
    mandatory requirement, "Needs attention" for partial gaps, and
    "On track" otherwise.
 
-Required JSON shape (exact keys):
+Required JSON shape (exact keys, and GENERATE THEM IN THIS ORDER — put the
+short, fixed-size fields first and the open-ended compliance_matrix LAST,
+so a length-limited response never gets cut off before the risk report,
+recommendation, and action plan):
 
 {{
   "categories": [
@@ -1022,15 +981,6 @@ Required JSON shape (exact keys):
       "summary": "<one sentence>"}}
     ... one entry for EACH of these categories, in this order: {category_list}
   ],
-  "compliance_matrix": [
-    {{"requirement": "<short requirement text>",
-      "category": "<one of: {category_list}>",
-      "status": "Met|Partial|Gap|Needs Review",
-      "evidence_document": "<document name or empty string>",
-      "evidence_page": <page number int, or null>,
-      "note": "<short note>"}}
-    ... one row per distinct requirement found in the evidence
-  ],
   "risks": {{
     "critical": ["<critical gap description>", ...],
     "warnings": ["<warning description>", ...],
@@ -1038,7 +988,17 @@ Required JSON shape (exact keys):
   }},
   "recommendation": "BID|BID WITH CONDITIONS|NO-BID|NEEDS REVIEW",
   "recommendation_reasoning": "<2-3 sentences>",
-  "action_plan": ["<concrete next step>", ...]
+  "action_plan": ["<concrete next step>", ...],
+  "compliance_matrix": [
+    {{"requirement": "<short requirement text>",
+      "category": "<one of: {category_list}>",
+      "status": "Met|Partial|Gap|Needs Review",
+      "evidence_document": "<document name or empty string>",
+      "evidence_page": <page number int, or null>,
+      "note": "<short note>"}}
+    ... one row per distinct requirement found in the evidence — this is
+    the largest section, and MUST be generated last
+  ]
 }}
 """
 
@@ -1065,11 +1025,66 @@ covering every category, using only the evidence above.
     raw_text, usage = _call_groq(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        max_tokens=4000,
+        # The compliance matrix can run to dozens of rows across up to
+        # REPORT_EVIDENCE_MAX_TOTAL evidence chunks — give it real
+        # headroom so it doesn't force-truncate the response.
+        max_tokens=7000,
         json_mode=True,
     )
 
     return parse_json_response(raw_text), raw_text, usage
+
+
+VALID_RECOMMENDATIONS = {"BID", "BID WITH CONDITIONS", "NO-BID", "NEEDS REVIEW"}
+
+
+def normalize_recommendation(raw) -> Tuple[str, bool]:
+    """Match the model's recommendation text to one of the four
+    canonical labels, tolerating extra wording around it (e.g. "Bid,
+    provided the ISO cert is obtained" or trailing punctuation) instead
+    of requiring an exact string — an exact-match-only check silently
+    collapses any deviation to NEEDS REVIEW regardless of the actual
+    score. Returns (label, was_exact_match)."""
+
+    text = str(raw or "").strip().upper()
+
+    if text in VALID_RECOMMENDATIONS:
+        return text, True
+
+    # Longest-first so "BID WITH CONDITIONS" is matched before the bare
+    # "BID" substring inside it, and "NO-BID" before "BID".
+    for candidate in sorted(VALID_RECOMMENDATIONS, key=len, reverse=True):
+        if candidate in text:
+            return candidate, False
+
+    return "NEEDS REVIEW", False
+
+
+def coerce_score(value) -> Optional[float]:
+    """Best-effort conversion of a category score to a 0-100 float.
+
+    The model is asked for a JSON int, but json_object mode only
+    guarantees valid JSON syntax, not our schema's types — Groq
+    sometimes emits "85" (a string) or "85%" instead of 85. Returns
+    None only when the value truly isn't a usable number, so a wrong
+    *type* doesn't silently vanish from the average the way a strict
+    isinstance(int, float) check would.
+    """
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        score = float(value)
+    elif isinstance(value, str):
+        try:
+            score = float(value.strip().rstrip("%"))
+        except ValueError:
+            return None
+    else:
+        return None
+
+    return max(0.0, min(100.0, score))
 
 
 def apply_score_rules(report: Dict) -> Dict:
@@ -1078,19 +1093,59 @@ def apply_score_rules(report: Dict) -> Dict:
     category scores and a recommendation, code computes the aggregate
     score and enforces a conservative override rule."""
 
-    categories = report.get("categories") or []
+    # A response cut off by the token limit still parses as valid JSON
+    # (json_mode force-closes open brackets), but keys generated after
+    # the cutoff point are simply absent — not merely empty. Checking
+    # "not in" (vs. plain .get()) catches that missing-key signature
+    # before it's masked by the "or {}" / "or []" defaults below.
+    report["likely_truncated"] = (
+        "risks" not in report
+        or "recommendation" not in report
+        or "action_plan" not in report
+    )
 
-    scores = [
-        category.get("score", 0)
-        for category in categories
-        if isinstance(category.get("score"), (int, float))
-    ]
+    raw_categories = report.get("categories") or []
+
+    normalized_categories = []
+    seen_names = set()
+    scores = []
+
+    for category in raw_categories:
+
+        name = category.get("name")
+
+        # Keep only the fixed rubric categories, one entry each, so the
+        # displayed table/chart and the averaged score always agree —
+        # a stray or duplicated category name from the model can't
+        # silently skew (or be dropped from) the average.
+        if name not in REPORT_CATEGORIES or name in seen_names:
+            continue
+
+        seen_names.add(name)
+
+        score = coerce_score(category.get("score"))
+
+        normalized_categories.append(
+            {**category, "score": score if score is not None else 0}
+        )
+
+        # Only a genuinely-parseable score counts toward the average —
+        # the display fallback above (0) must not be double-counted
+        # as if the model had actually reported zero.
+        if score is not None:
+            scores.append(score)
+
+    report["categories"] = normalized_categories
 
     overall_score = round(sum(scores) / len(scores)) if scores else 0
 
-    recommendation = report.get(
-        "recommendation", "NEEDS REVIEW"
+    raw_recommendation = report.get("recommendation", "")
+    recommendation, recommendation_was_exact = normalize_recommendation(
+        raw_recommendation
     )
+
+    report["raw_recommendation"] = str(raw_recommendation)
+    report["recommendation_was_exact"] = recommendation_was_exact
 
     risks = report.get("risks") or {}
     critical_risks = risks.get("critical") or []
@@ -1195,6 +1250,173 @@ def report_to_markdown(report: Dict) -> str:
     return "\n".join(lines)
 
 
+def report_to_pdf(report: Dict) -> bytes:
+    """Render the report as a paginated PDF via PyMuPDF's Story (HTML/CSS)
+    engine — PyMuPDF is already a dependency for PDF text extraction, so
+    this needs no extra package just to also write PDFs."""
+
+    def esc(value) -> str:
+        return html.escape(str(value if value is not None else ""))
+
+    recommendation_colors = {
+        "BID": "#16A34A",
+        "BID WITH CONDITIONS": "#D97706",
+        "NO-BID": "#DC2626",
+        "NEEDS REVIEW": "#64748B",
+    }
+
+    status_colors = {
+        "On track": "#16A34A",
+        "Needs attention": "#D97706",
+        "Critical gap": "#DC2626",
+        "Met": "#16A34A",
+        "Partial": "#D97706",
+        "Gap": "#DC2626",
+        "Needs Review": "#64748B",
+    }
+
+    recommendation = report.get("final_recommendation", "NEEDS REVIEW")
+    rec_color = recommendation_colors.get(recommendation, "#64748B")
+
+    parts = [
+        "<h1>BidReady AI</h1>",
+        "<h2>Bid readiness report</h2>",
+        (
+            f'<p><b>Overall score:</b> {esc(report.get("overall_score", 0))}%'
+            f"<br/><b>Recommendation:</b> "
+            f'<span style="color:{rec_color}"><b>{esc(recommendation)}</b></span></p>'
+        ),
+    ]
+
+    if report.get("override_note"):
+        parts.append(
+            '<p style="color:#92400E; background:#FEF3C7; padding:6px;">'
+            f'{esc(report["override_note"])}</p>'
+        )
+
+    if report.get("recommendation_reasoning"):
+        parts.append(f'<p><i>{esc(report["recommendation_reasoning"])}</i></p>')
+
+    parts.append("<h2>Category scores</h2>")
+    parts.append("<table>")
+    parts.append(
+        "<tr><th>Category</th><th>Score</th><th>Status</th><th>Summary</th></tr>"
+    )
+
+    for category in report.get("categories") or []:
+
+        status = category.get("status", "")
+        color = status_colors.get(status, "#0F172A")
+
+        parts.append(
+            "<tr>"
+            f"<td>{esc(category.get('name', ''))}</td>"
+            f"<td>{esc(category.get('score', 0))}%</td>"
+            f'<td style="color:{color}"><b>{esc(status)}</b></td>'
+            f"<td>{esc(category.get('summary', ''))}</td>"
+            "</tr>"
+        )
+
+    parts.append("</table>")
+
+    parts.append("<h2>Compliance matrix</h2>")
+    parts.append("<table>")
+    parts.append(
+        "<tr><th>Requirement</th><th>Category</th><th>Status</th>"
+        "<th>Evidence</th><th>Note</th></tr>"
+    )
+
+    for row in report.get("compliance_matrix") or []:
+
+        status = row.get("status", "")
+        color = status_colors.get(status, "#0F172A")
+        evidence_doc = row.get("evidence_document", "")
+        evidence_page = row.get("evidence_page")
+        evidence = (
+            f"{evidence_doc} p.{evidence_page}"
+            if evidence_doc and evidence_page
+            else evidence_doc
+        )
+
+        parts.append(
+            "<tr>"
+            f"<td>{esc(row.get('requirement', ''))}</td>"
+            f"<td>{esc(row.get('category', ''))}</td>"
+            f'<td style="color:{color}"><b>{esc(status)}</b></td>'
+            f"<td>{esc(evidence)}</td>"
+            f"<td>{esc(row.get('note', ''))}</td>"
+            "</tr>"
+        )
+
+    parts.append("</table>")
+
+    risks = report.get("risks") or {}
+
+    def risk_section(title: str, items: List[str], color: str) -> None:
+        parts.append(f'<h3 style="color:{color}">{esc(title)}</h3>')
+        if items:
+            parts.append("<ul>")
+            for item in items:
+                parts.append(f"<li>{esc(item)}</li>")
+            parts.append("</ul>")
+        else:
+            parts.append("<p><i>None identified.</i></p>")
+
+    parts.append("<h2>Risk report</h2>")
+    risk_section("Critical gaps", risks.get("critical") or [], "#DC2626")
+    risk_section("Warnings", risks.get("warnings") or [], "#D97706")
+    risk_section("Strengths", risks.get("strengths") or [], "#16A34A")
+
+    parts.append("<h2>Action plan</h2>")
+
+    action_plan = report.get("action_plan") or []
+
+    if action_plan:
+        parts.append("<ol>")
+        for step in action_plan:
+            parts.append(f"<li>{esc(step)}</li>")
+        parts.append("</ol>")
+    else:
+        parts.append("<p><i>No action items.</i></p>")
+
+    parts.append(
+        '<p style="color:#64748B; font-size:9px;">'
+        "BidReady AI is an AI-assisted decision-support tool. Always "
+        "verify requirements against the original tender documentation "
+        "before making a final bid decision.</p>"
+    )
+
+    html_doc = "<!DOCTYPE html><html><body>" + "".join(parts) + "</body></html>"
+
+    css = """
+    body { font-family: sans-serif; font-size: 11px; color: #0F172A; }
+    h1 { font-size: 22px; margin-bottom: 0; }
+    h2 { font-size: 16px; margin-top: 18px; }
+    h3 { font-size: 13px; margin-bottom: 4px; }
+    table { border-collapse: collapse; width: 100%; margin: 6px 0; }
+    th { background: #F8FAFC; text-align: left; }
+    td, th { border: 1px solid #E2E8F0; padding: 4px; }
+    """
+
+    media_box = fitz.paper_rect("a4")
+    where = media_box + (36, 36, -36, -36)
+
+    story = fitz.Story(html=html_doc, user_css=css)
+    buffer = io.BytesIO()
+    writer = fitz.DocumentWriter(buffer)
+
+    more = True
+    while more:
+        device = writer.begin_page(media_box)
+        more, _ = story.place(where)
+        story.draw(device)
+        writer.end_page()
+
+    writer.close()
+
+    return buffer.getvalue()
+
+
 # ============================================================
 # DOCUMENT INGESTION
 # ============================================================
@@ -1265,20 +1487,8 @@ def process_documents(
 # HEADER
 # ============================================================
 
-st.markdown(
-    '<div class="main-title">🎯 BidReady AI</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="subtitle">
-        Know Before You Bid — RAG-powered tender intelligence
-        for businesses.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.title(APP_NAME, icon=":material/fact_check:")
+st.caption("Know before you bid — RAG-powered tender intelligence for businesses")
 
 st.write(
     "Upload your company profile and tender, then ask questions "
@@ -1292,20 +1502,18 @@ st.write(
 
 with st.sidebar:
 
-    st.header("⚙️ Configuration")
+    st.header("Configuration", icon=":material/settings:")
 
-    st.info(
-        "This application uses:\n\n"
-        "• PyMuPDF / python-docx for PDF, DOCX, TXT, and JSON "
-        "extraction\n"
-        "• Sentence Transformers for embeddings\n"
-        "• FAISS for vector retrieval\n"
-        "• Groq for LLM reasoning"
-    )
+    st.caption("Built with")
 
-    st.divider()
+    with st.container(horizontal=True):
+        st.badge("PyMuPDF", color="blue")
+        st.badge("python-docx", color="blue")
+        st.badge("Sentence Transformers", color="violet")
+        st.badge("FAISS", color="orange")
+        st.badge("Groq", color="green")
 
-    st.subheader("Required API Key")
+    st.subheader("Required API key", icon=":material/key:")
 
     st.code(
         "GROQ_API_KEY",
@@ -1317,12 +1525,13 @@ with st.sidebar:
         "Cloud Secrets."
     )
 
-    st.divider()
+    st.subheader("Status", icon=":material/monitoring:")
 
     if st.session_state.documents_ready:
 
         st.success(
-            "Knowledge base ready"
+            "Knowledge base ready",
+            icon=":material/check_circle:",
         )
 
         st.metric(
@@ -1335,7 +1544,8 @@ with st.sidebar:
     else:
 
         st.warning(
-            "Upload both documents to build the knowledge base."
+            "Upload both documents to build the knowledge base.",
+            icon=":material/upload_file:",
         )
 
 
@@ -1343,7 +1553,7 @@ with st.sidebar:
 # DOCUMENT UPLOAD
 # ============================================================
 
-st.header("📄 1. Upload Documents")
+st.header("Step 1 · Upload documents", icon=":material/upload_file:")
 
 col1, col2 = st.columns(2)
 
@@ -1380,9 +1590,10 @@ with col2:
 if tender_file and company_file:
 
     if st.button(
-        "🔎 Build BidReady Knowledge Base",
+        "Build knowledge base",
+        icon=":material/database:",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     ):
 
         with st.status(
@@ -1434,7 +1645,7 @@ if tender_file and company_file:
 
 if st.session_state.documents_ready:
 
-    st.header("📚 Knowledge Base")
+    st.header("Knowledge base", icon=":material/database:")
 
     tender_pages_count = sum(
         1
@@ -1466,7 +1677,8 @@ if st.session_state.documents_ready:
     )
 
     with st.expander(
-        "🔍 View indexed document information"
+        "View indexed document information",
+        icon=":material/description:",
     ):
 
         st.dataframe(
@@ -1478,12 +1690,13 @@ if st.session_state.documents_ready:
                 }
                 for item in st.session_state.documents
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
     with st.expander(
-        "📇 View extracted company profile text (sent to the model)"
+        "View extracted company profile text (sent to the model)",
+        icon=":material/badge:",
     ):
 
         company_profile_preview = "\n\n---\n\n".join(
@@ -1518,9 +1731,7 @@ if st.session_state.documents_ready:
 
 if st.session_state.documents_ready:
 
-    st.divider()
-
-    st.header("📊 2. Bid Readiness Report")
+    st.header("Step 2 · Bid readiness report", icon=":material/analytics:")
 
     st.caption(
         "Generates a scored breakdown across "
@@ -1529,8 +1740,10 @@ if st.session_state.documents_ready:
     )
 
     if st.button(
-        "🧮 Generate Bid Readiness Report",
-        use_container_width=True,
+        "Generate bid readiness report",
+        icon=":material/query_stats:",
+        type="primary",
+        width="stretch",
     ):
 
         company_chunks = [
@@ -1587,6 +1800,7 @@ if st.session_state.documents_ready:
                         report = apply_score_rules(parsed)
                         st.session_state.report = report
                         st.session_state.report_usage = usage
+                        st.session_state.report_version += 1
 
                 except Exception as exc:
 
@@ -1596,69 +1810,112 @@ if st.session_state.documents_ready:
 
     if report:
 
+        if report.get("likely_truncated"):
+            st.warning(
+                "The model's response looks like it was cut off before "
+                "finishing the risk report, recommendation, and/or "
+                "action plan (the compliance matrix can run long and "
+                "use up the response budget) — those sections below may "
+                "be missing. Try generating the report again.",
+                icon=":material/warning:",
+            )
+
         overall_score = report.get("overall_score", 0)
         recommendation = report.get(
             "final_recommendation", "NEEDS REVIEW"
         )
-        decision_color = RECOMMENDATION_COLORS.get(
-            recommendation, "#64748B"
+        badge_color = RECOMMENDATION_BADGE_COLORS.get(
+            recommendation, "gray"
+        )
+        badge_icon = RECOMMENDATION_ICONS.get(
+            recommendation, ":material/help:"
         )
 
-        st.markdown(
-            f"""
-            <div class="decision-card" style="background: {decision_color}1A;
-                 border: 1px solid {decision_color};">
-                <div class="score" style="color: {decision_color};">
-                    {overall_score}%
-                </div>
-                <div class="decision" style="color: {decision_color};">
-                    {recommendation}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        with st.container(border=True):
+
+            score_col, decision_col = st.columns(
+                [1, 2], vertical_alignment="center"
+            )
+
+            with score_col:
+                st.metric("Bid readiness score", f"{overall_score}%")
+
+            with decision_col:
+                st.badge(recommendation, icon=badge_icon, color=badge_color)
+
+                if report.get("recommendation_reasoning"):
+                    st.write(report["recommendation_reasoning"])
+
+            if report.get("override_note"):
+                st.warning(report["override_note"], icon=":material/rule:")
+
+            if not report.get("recommendation_was_exact", True):
+                st.caption(
+                    "The model's raw recommendation text didn't exactly "
+                    "match one of the four expected labels, so it was "
+                    f"matched to **{recommendation}**. Raw text: "
+                    f"\"{report.get('raw_recommendation', '')}\""
+                )
+
+        st.subheader("Category scores", icon=":material/bar_chart:")
+
+        categories_data = report.get("categories") or []
+
+        st.bar_chart(
+            [
+                {
+                    "Category": category.get("name", ""),
+                    "Score": category.get("score", 0),
+                }
+                for category in categories_data
+            ],
+            x="Category",
+            y="Score",
+            color="Category",
+            horizontal=True,
+            y_label="Score (%)",
         )
-
-        if report.get("override_note"):
-            st.warning(report["override_note"])
-
-        if report.get("recommendation_reasoning"):
-            st.write(report["recommendation_reasoning"])
-
-        st.subheader("Category Scores")
 
         st.dataframe(
             [
                 {
-                    "Category": category.get("name", ""),
-                    "Score": f"{category.get('score', 0)}%",
-                    "Status": category.get("status", ""),
+                    "Category": [category.get("name", "")],
+                    "Score": category.get("score", 0),
+                    "Status": [category.get("status", "")],
                     "Summary": category.get("summary", ""),
                 }
-                for category in report.get("categories") or []
+                for category in categories_data
             ],
-            use_container_width=True,
+            column_config={
+                "Category": st.column_config.MultiselectColumn(
+                    "Category",
+                    options=REPORT_CATEGORIES,
+                    color="auto",
+                ),
+                "Score": st.column_config.ProgressColumn(
+                    "Score",
+                    min_value=0,
+                    max_value=100,
+                    format="%d%%",
+                ),
+                "Status": st.column_config.MultiselectColumn(
+                    "Status",
+                    options=["On track", "Needs attention", "Critical gap"],
+                    color=["green", "orange", "red"],
+                ),
+            },
+            width="stretch",
             hide_index=True,
         )
 
-        st.subheader("Compliance Matrix")
-
-        status_icons = {
-            "Met": "✅",
-            "Partial": "🟡",
-            "Gap": "❌",
-            "Needs Review": "❓",
-        }
+        st.subheader("Compliance matrix", icon=":material/checklist:")
 
         st.dataframe(
             [
                 {
                     "Requirement": row.get("requirement", ""),
-                    "Category": row.get("category", ""),
-                    "Status": (
-                        f"{status_icons.get(row.get('status', ''), '')} "
-                        f"{row.get('status', '')}"
-                    ),
+                    "Category": [row.get("category", "")],
+                    "Status": [row.get("status", "")],
                     "Evidence": (
                         f"{row.get('evidence_document', '')} "
                         f"p.{row.get('evidence_page')}"
@@ -1670,37 +1927,67 @@ if st.session_state.documents_ready:
                 }
                 for row in report.get("compliance_matrix") or []
             ],
-            use_container_width=True,
+            column_config={
+                "Category": st.column_config.MultiselectColumn(
+                    "Category",
+                    options=REPORT_CATEGORIES,
+                    color="auto",
+                ),
+                "Status": st.column_config.MultiselectColumn(
+                    "Status",
+                    options=["Met", "Partial", "Gap", "Needs Review"],
+                    color=["green", "orange", "red", "gray"],
+                ),
+            },
+            width="stretch",
             hide_index=True,
         )
 
-        st.subheader("Risk Report")
+        st.subheader("Risk report", icon=":material/shield:")
 
         risks = report.get("risks") or {}
 
         risk_col1, risk_col2, risk_col3 = st.columns(3)
 
         with risk_col1:
-            st.markdown("**🔴 Critical Gaps**")
-            for item in risks.get("critical") or []:
-                st.write(f"- {item}")
+            with st.container(border=True):
+                st.badge("Critical gaps", icon=":material/error:", color="red")
+                items = risks.get("critical") or []
+                if items:
+                    for item in items:
+                        st.write(f"- {item}")
+                else:
+                    st.caption("None identified.")
 
         with risk_col2:
-            st.markdown("**🟡 Warnings**")
-            for item in risks.get("warnings") or []:
-                st.write(f"- {item}")
+            with st.container(border=True):
+                st.badge("Warnings", icon=":material/warning:", color="orange")
+                items = risks.get("warnings") or []
+                if items:
+                    for item in items:
+                        st.write(f"- {item}")
+                else:
+                    st.caption("None identified.")
 
         with risk_col3:
-            st.markdown("**🟢 Strengths**")
-            for item in risks.get("strengths") or []:
-                st.write(f"- {item}")
+            with st.container(border=True):
+                st.badge("Strengths", icon=":material/thumb_up:", color="green")
+                items = risks.get("strengths") or []
+                if items:
+                    for item in items:
+                        st.write(f"- {item}")
+                else:
+                    st.caption("None identified.")
 
-        st.subheader("Action Plan")
+        st.subheader("Action plan", icon=":material/checklist_rtl:")
 
         for number, step in enumerate(
             report.get("action_plan") or [], start=1
         ):
-            st.write(f"{number}. {step}")
+            st.checkbox(
+                f"{number}. {step}",
+                key=f"action_step_{st.session_state.report_version}_{number}",
+            )
 
         report_usage = st.session_state.get("report_usage")
 
@@ -1713,13 +2000,27 @@ if st.session_state.documents_ready:
                 f"(~${estimate_cost(report_usage):.5f} estimated)."
             )
 
-        st.download_button(
-            "⬇️ Download Report (Markdown)",
-            data=report_to_markdown(report),
-            file_name="bidready_report.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
+        download_col1, download_col2 = st.columns(2)
+
+        with download_col1:
+            st.download_button(
+                "Download report (PDF)",
+                icon=":material/picture_as_pdf:",
+                data=report_to_pdf(report),
+                file_name="bidready_report.pdf",
+                mime="application/pdf",
+                width="stretch",
+            )
+
+        with download_col2:
+            st.download_button(
+                "Download report (Markdown)",
+                icon=":material/download:",
+                data=report_to_markdown(report),
+                file_name="bidready_report.md",
+                mime="text/markdown",
+                width="stretch",
+            )
 
 
 # ============================================================
@@ -1728,9 +2029,7 @@ if st.session_state.documents_ready:
 
 if st.session_state.documents_ready:
 
-    st.divider()
-
-    st.header("💬 3. Ask BidReady AI")
+    st.header("Step 3 · Ask BidReady AI", icon=":material/forum:")
 
     st.caption(
         "Ask whether the tender is suitable, what requirements "
@@ -1835,11 +2134,12 @@ if st.session_state.documents_ready:
 
                 if not is_grounded:
                     st.warning(
-                        "⚠️ This answer cites page(s) "
+                        "This answer cites page(s) "
                         f"{', '.join(str(p) for p in unverified_pages)} "
                         "that weren't in the retrieved evidence for this "
                         "question — treat that citation as unverified and "
-                        "check the source document directly."
+                        "check the source document directly.",
+                        icon=":material/report:",
                     )
 
                 cost = estimate_cost(usage)
@@ -1859,18 +2159,13 @@ if st.session_state.documents_ready:
                     f"${cost:.5f}",
                 )
 
-                st.caption(
-                    "Cost is a rough estimate based on placeholder "
-                    "per-token pricing — see GROQ_INPUT_COST_PER_M / "
-                    "GROQ_OUTPUT_COST_PER_M in app.py."
-                )
-
                 # ----------------------------------------
                 # RETRIEVED EVIDENCE
                 # ----------------------------------------
 
                 with st.expander(
-                    f"🔎 Retrieved Evidence ({len(results)} chunks)"
+                    f"Retrieved evidence ({len(results)} chunks)",
+                    icon=":material/search:",
                 ):
 
                     for number, result in enumerate(
@@ -1878,30 +2173,14 @@ if st.session_state.documents_ready:
                         start=1,
                     ):
 
-                        st.markdown(
-                            f"""
-                            <div class="evidence-card">
-
-                            <strong>
-                            Evidence {number}
-                            </strong>
-
-                            <br>
-
-                            <span class="small-label">
-                            {result['document']}
-                            • Page {result['page']}
-                            • Similarity {result['similarity']:.3f}
-                            </span>
-
-                            <br><br>
-
-                            {result['text']}
-
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
+                        with st.container(border=True):
+                            st.markdown(f"**Evidence {number}**")
+                            st.caption(
+                                f"{result['document']} • "
+                                f"Page {result['page']} • "
+                                f"Similarity {result['similarity']:.3f}"
+                            )
+                            st.write(result["text"])
 
             except Exception as exc:
 
@@ -1912,16 +2191,15 @@ if st.session_state.documents_ready:
 else:
 
     st.info(
-        "👆 Upload both a tender document and a company profile "
-        "document, then build the knowledge base."
+        "Upload both a tender document and a company profile "
+        "document, then build the knowledge base.",
+        icon=":material/upload_file:",
     )
 
 
 # ============================================================
 # FOOTER
 # ============================================================
-
-st.divider()
 
 st.caption(
     "BidReady AI is an AI-assisted decision-support tool. "

@@ -1,0 +1,54 @@
+[server]
+# "auto"/"watchdog" walks every loaded Python module (including
+# transformers' lazy optional vision-model submodules) to support
+# hot-reload on save, which spams the terminal with harmless
+# ModuleNotFoundError tracebacks for torchvision (unused here).
+# Disabling it just means restarting the app manually after edits.
+fileWatcherType = "none"
+
+[theme]
+# Shared across light/dark — per-variant [theme.light]/[theme.dark]
+# blocks below only support color/font/radius keys, not baseFontSize.
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+baseFontSize = 15
+baseRadius = "10px"
+showWidgetBorder = true
+
+[theme.light]
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#0F172A"
+borderColor = "#E2E8F0"
+linkColor = "#2563EB"
+redColor = "#DC2626"
+orangeColor = "#D97706"
+yellowColor = "#CA8A04"
+greenColor = "#16A34A"
+blueColor = "#2563EB"
+violetColor = "#7C3AED"
+grayColor = "#64748B"
+chartCategoricalColors = [
+    "#2563EB", "#16A34A", "#7C3AED", "#D97706",
+    "#DB2777", "#0891B2", "#DC2626",
+]
+
+[theme.dark]
+primaryColor = "#60A5FA"
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+textColor = "#E2E8F0"
+borderColor = "#334155"
+linkColor = "#60A5FA"
+redColor = "#EF4444"
+orangeColor = "#F59E0B"
+yellowColor = "#EAB308"
+greenColor = "#22C55E"
+blueColor = "#60A5FA"
+violetColor = "#A78BFA"
+grayColor = "#94A3B8"
+chartCategoricalColors = [
+    "#60A5FA", "#4ADE80", "#A78BFA", "#FBBF24",
+    "#F472B6", "#22D3EE", "#F87171",
+]
