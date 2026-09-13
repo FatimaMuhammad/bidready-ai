@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -15,6 +16,11 @@ try:
     import faiss
 except ImportError:
     faiss = None
+
+try:
+    import docx  # python-docx
+except ImportError:
+    docx = None
 
 
 # ============================================================
@@ -251,6 +257,220 @@ def extract_pdf_pages(
     document.close()
 
     return pages
+
+
+# ============================================================
+# DOCX EXTRACTION
+# ============================================================
+
+def extract_docx_pages(
+    uploaded_file,
+    document_type: str,
+) -> List[Dict]:
+
+    if docx is None:
+        raise ValueError(
+            "python-docx is not installed, so .docx files can't be "
+            "read. Add 'python-docx' to requirements.txt."
+        )
+
+    docx_bytes = uploaded_file.getvalue()
+
+    try:
+        document = docx.Document(
+            io.BytesIO(docx_bytes)
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"Could not open {uploaded_file.name}: {exc}"
+        )
+
+    parts = []
+
+    for paragraph in document.paragraphs:
+
+        text = paragraph.text.strip()
+
+        if text:
+            parts.append(text)
+
+    for table in document.tables:
+
+        for row in table.rows:
+
+            cells = [
+                cell.text.strip()
+                for cell in row.cells
+            ]
+
+            row_text = " | ".join(
+                cell for cell in cells if cell
+            )
+
+            if row_text:
+                parts.append(row_text)
+
+    text = "\n".join(parts).strip()
+
+    if not text:
+        return []
+
+    # Word documents don't expose reliable page boundaries via
+    # python-docx, so the whole document is treated as one logical
+    # page; citations for .docx sources will all read "Page 1".
+    return [
+        {
+            "document": uploaded_file.name,
+            "document_type": document_type,
+            "page": 1,
+            "text": text,
+        }
+    ]
+
+
+# ============================================================
+# PLAIN TEXT EXTRACTION
+# ============================================================
+
+def extract_txt_pages(
+    uploaded_file,
+    document_type: str,
+) -> List[Dict]:
+
+    raw_bytes = uploaded_file.getvalue()
+
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw_bytes.decode("utf-8", errors="replace")
+
+    # Some plain-text exports use a form-feed character as a page
+    # break; split on it if present, otherwise treat as one page.
+    raw_pages = text.split("\x0c")
+
+    pages = []
+
+    for page_number, page_text in enumerate(raw_pages, start=1):
+
+        page_text = page_text.strip()
+
+        if page_text:
+            pages.append(
+                {
+                    "document": uploaded_file.name,
+                    "document_type": document_type,
+                    "page": page_number,
+                    "text": page_text,
+                }
+            )
+
+    return pages
+
+
+# ============================================================
+# JSON EXTRACTION (company profile)
+# ============================================================
+
+def flatten_json_to_lines(
+    data,
+    prefix: str = "",
+) -> List[str]:
+    """Turn arbitrary JSON into readable 'path: value' lines so it
+    reads like structured profile text rather than raw JSON syntax."""
+
+    lines = []
+
+    if isinstance(data, dict):
+
+        for key, value in data.items():
+
+            path = f"{prefix}.{key}" if prefix else str(key)
+
+            if isinstance(value, (dict, list)):
+                lines.extend(flatten_json_to_lines(value, path))
+            else:
+                lines.append(f"{path}: {value}")
+
+    elif isinstance(data, list):
+
+        for index, item in enumerate(data):
+
+            path = f"{prefix}[{index}]"
+
+            if isinstance(item, (dict, list)):
+                lines.extend(flatten_json_to_lines(item, path))
+            else:
+                lines.append(f"{path}: {item}")
+
+    else:
+        lines.append(f"{prefix}: {data}")
+
+    return lines
+
+
+def extract_json_pages(
+    uploaded_file,
+    document_type: str,
+) -> List[Dict]:
+
+    raw_bytes = uploaded_file.getvalue()
+
+    try:
+        data = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Could not parse {uploaded_file.name} as JSON: {exc}"
+        )
+
+    text = "\n".join(
+        flatten_json_to_lines(data)
+    ).strip()
+
+    if not text:
+        return []
+
+    return [
+        {
+            "document": uploaded_file.name,
+            "document_type": document_type,
+            "page": 1,
+            "text": text,
+        }
+    ]
+
+
+# ============================================================
+# DOCUMENT EXTRACTION DISPATCH
+# ============================================================
+
+EXTRACTORS_BY_EXTENSION = {
+    "pdf": extract_pdf_pages,
+    "docx": extract_docx_pages,
+    "txt": extract_txt_pages,
+    "json": extract_json_pages,
+}
+
+
+def extract_document_pages(
+    uploaded_file,
+    document_type: str,
+) -> List[Dict]:
+
+    extension = (
+        uploaded_file.name.rsplit(".", 1)[-1].lower()
+        if "." in uploaded_file.name
+        else ""
+    )
+
+    extractor = EXTRACTORS_BY_EXTENSION.get(extension)
+
+    if extractor is None:
+        raise ValueError(
+            f"Unsupported file type '.{extension}' for "
+            f"{uploaded_file.name}."
+        )
+
+    return extractor(uploaded_file, document_type)
 
 
 # ============================================================
@@ -986,9 +1206,9 @@ def process_documents(
 ):
 
     if status:
-        status.update(label="Extracting text from PDFs...")
+        status.update(label="Extracting text from documents...")
 
-    tender_pages = extract_pdf_pages(
+    tender_pages = extract_document_pages(
         tender_file,
         "Tender",
     )
@@ -996,10 +1216,11 @@ def process_documents(
     if not tender_pages:
         raise ValueError(
             f"No extractable text was found in '{tender_file.name}'. "
-            "It may be a scanned/image-only PDF — try a text-based PDF."
+            "If it's a PDF, it may be scanned/image-only — try a "
+            "text-based PDF, DOCX, or TXT file instead."
         )
 
-    company_pages = extract_pdf_pages(
+    company_pages = extract_document_pages(
         company_file,
         "Company Profile",
     )
@@ -1007,7 +1228,8 @@ def process_documents(
     if not company_pages:
         raise ValueError(
             f"No extractable text was found in '{company_file.name}'. "
-            "It may be a scanned/image-only PDF — try a text-based PDF."
+            "If it's a PDF, it may be scanned/image-only — try a "
+            "text-based PDF, DOCX, JSON, or TXT file instead."
         )
 
     all_pages = tender_pages + company_pages
@@ -1074,7 +1296,8 @@ with st.sidebar:
 
     st.info(
         "This application uses:\n\n"
-        "• PyMuPDF for PDF extraction\n"
+        "• PyMuPDF / python-docx for PDF, DOCX, TXT, and JSON "
+        "extraction\n"
         "• Sentence Transformers for embeddings\n"
         "• FAISS for vector retrieval\n"
         "• Groq for LLM reasoning"
@@ -1112,7 +1335,7 @@ with st.sidebar:
     else:
 
         st.warning(
-            "Upload both PDFs to build the knowledge base."
+            "Upload both documents to build the knowledge base."
         )
 
 
@@ -1127,23 +1350,25 @@ col1, col2 = st.columns(2)
 with col1:
 
     tender_file = st.file_uploader(
-        "Tender / RFP PDF",
-        type=["pdf"],
-        key="tender_pdf",
+        "Tender / RFP Document",
+        type=["pdf", "docx", "txt"],
+        key="tender_doc",
         help=(
-            "Upload the tender you want to evaluate."
+            "Upload the tender you want to evaluate "
+            "(PDF, DOCX, or TXT)."
         ),
     )
 
 with col2:
 
     company_file = st.file_uploader(
-        "Company Profile PDF",
-        type=["pdf"],
-        key="company_pdf",
+        "Company Profile Document",
+        type=["pdf", "docx", "json", "txt"],
+        key="company_doc",
         help=(
-            "Upload your company's profile, "
-            "capabilities, experience, certifications, etc."
+            "Upload your company's profile, capabilities, "
+            "experience, certifications, etc. "
+            "(PDF, DOCX, JSON, or TXT)."
         ),
     )
 
@@ -1257,6 +1482,35 @@ if st.session_state.documents_ready:
             hide_index=True,
         )
 
+    with st.expander(
+        "📇 View extracted company profile text (sent to the model)"
+    ):
+
+        company_profile_preview = "\n\n---\n\n".join(
+            item["text"]
+            for item in st.session_state.documents
+            if item["document_type"] == "Company Profile"
+        )
+
+        st.caption(
+            f"{len(company_profile_preview)} characters extracted "
+            "from the company profile document. If this is empty, "
+            "very short, or missing key facts (years of experience, "
+            "certifications, past projects), the source file's text "
+            "likely wasn't extracted properly (e.g. a scanned or "
+            "logo/table/image-heavy PDF) and the report will show "
+            "gaps for everything, even if those facts are present "
+            "in the original file."
+        )
+
+        st.text_area(
+            "Extracted text",
+            value=company_profile_preview or "(no text extracted)",
+            height=250,
+            disabled=True,
+            label_visibility="collapsed",
+        )
+
 
 # ============================================================
 # BID READINESS REPORT
@@ -1293,8 +1547,9 @@ if st.session_state.documents_ready:
 
             st.warning(
                 "No company profile text is indexed — re-upload a "
-                "text-based company profile PDF and rebuild the "
-                "knowledge base before generating a report."
+                "text-based company profile file (PDF, DOCX, JSON, "
+                "or TXT) and rebuild the knowledge base before "
+                "generating a report."
             )
 
         else:
@@ -1552,7 +1807,7 @@ if st.session_state.documents_ready:
                         "No company profile text is indexed, so an "
                         "answer would not be grounded in your company's "
                         "actual capabilities. Re-upload a text-based "
-                        "company profile PDF and rebuild the knowledge base."
+                        "company profile file and rebuild the knowledge base."
                     )
                     st.stop()
 
@@ -1657,8 +1912,8 @@ if st.session_state.documents_ready:
 else:
 
     st.info(
-        "👆 Upload both a tender PDF and a company profile PDF, "
-        "then build the knowledge base."
+        "👆 Upload both a tender document and a company profile "
+        "document, then build the knowledge base."
     )
 
 
